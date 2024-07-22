@@ -31,11 +31,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ansible-facts
-          path: /home/runner/work/ansible-facts/ansible-facts/target/release/ansible-facts
+          path: ./target/release/saltbox-facts
 
       - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
         with:
           files: |
-            /home/runner/work/ansible-facts/ansible-facts/target/release/ansible-facts
+            ./target/release/saltbox-facts
