@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "timezone": timezone_data
     });
 
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
