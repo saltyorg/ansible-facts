@@ -1,6 +1,6 @@
 [package]
 name = "saltbox-facts"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 
 [profile.dev]
@@ -8,7 +8,8 @@ opt-level = 0
 
 [profile.release]
 opt-level = 3
-strip="debuginfo"
+strip = true
+codegen-units = 1
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
