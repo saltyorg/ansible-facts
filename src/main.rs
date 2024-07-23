@@ -11,6 +11,7 @@ use std::env;
 const TIMEOUT: u64 = 3;
 const GROUP_FILE_PATH: &str = "/etc/group";
 const PASSWD_FILE_PATH: &str = "/etc/passwd";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timezone_data = get_timezone()?;
 
     let result = json!({
+        "saltbox_facts_version": VERSION,
         "ip": {
             "public_ip": ipv4.as_deref().unwrap_or(""),
             "public_ipv6": ipv6.as_deref().unwrap_or(""),
