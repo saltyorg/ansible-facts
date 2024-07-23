@@ -1,6 +1,6 @@
 [package]
 name = "saltbox-facts"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [profile.dev]
@@ -14,6 +14,6 @@ codegen-units = 1
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.38.1", features = ["full"] }
-reqwest = { version = "0.12.5", features = ["json"] }
+tokio = { version = "1.39.0", features = ["full"] }
+reqwest = { version = "0.12.5", features = ["json", "rustls-tls"], default-features = false }
 serde_json = "1.0.120"
