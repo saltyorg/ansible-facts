@@ -60,26 +60,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn get_ip(client: &Client, urls: &[&str], is_ipv6: bool) -> (Option<String>, Option<String>) {
+    let mut errors = Vec::new();
+
     for url in urls {
         match timeout(Duration::from_secs(TIMEOUT), client.get(*url).send()).await {
             Ok(Ok(response)) => {
                 if response.status().is_success() {
-                    if let Ok(ip) = response.text().await {
-                        let ip = ip.trim();
-                        if validate_ip(ip, is_ipv6) {
-                            return (Some(ip.to_string()), None);
-                        } else {
-                            return (None, Some(format!("Invalid {} address received.", if is_ipv6 { "IPv6" } else { "IPv4" })));
+                    match response.text().await {
+                        Ok(ip) => {
+                            let ip = ip.trim();
+                            if validate_ip(ip, is_ipv6) {
+                                return (Some(ip.to_string()), None);
+                            } else {
+                                let error = format!("Invalid {} address '{}' received from {}",
+                                    if is_ipv6 { "IPv6" } else { "IPv4" }, ip, url);
+                                errors.push(error);
+                            }
+                        }
+                        Err(e) => {
+                            let error = format!("Failed to read response body from {}: {}", url, e);
+                            errors.push(error);
                         }
                     }
                 } else {
-                    return (None, Some(format!("HTTP {} received from {}.", response.status(), url)));
+                    let error = format!("HTTP {} received from {}", response.status(), url);
+                    errors.push(error);
                 }
             }
-            _ => continue,
+            Ok(Err(e)) => {
+                let error = format!("Request failed for {}: {}", url, e);
+                errors.push(error);
+            }
+            Err(_) => {
+                let error = format!("Timeout after {}s for {}", TIMEOUT, url);
+                errors.push(error);
+            }
         }
     }
-    (None, Some("All requests failed".to_string()))
+
+    let combined_error = if errors.is_empty() {
+        "All requests failed with unknown errors".to_string()
+    } else {
+        errors.join("; ")
+    };
+
+    (None, Some(combined_error))
 }
 
 fn validate_ip(ip: &str, is_ipv6: bool) -> bool {
