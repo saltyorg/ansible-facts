@@ -40,6 +40,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set version from tag
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${{ github.ref_name }}"
+            # Remove 'v' prefix if present
+            VERSION="${VERSION#v}"
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+            echo "Setting version to: $VERSION"
+          else
+            # For workflow_dispatch, use a default or current date-based version
+            VERSION="0.0.0-dev.$(date +%Y%m%d%H%M%S)"
+            echo "VERSION=$VERSION" >> $GITHUB_ENV
+            echo "No tag found, using dev version: $VERSION"
+          fi
+
+      - name: Update Cargo.toml version
+        run: |
+          sed -i 's/^version = ".*"/version = "'$VERSION'"/' Cargo.toml
+          echo "Updated Cargo.toml:"
+          grep "^version" Cargo.toml
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
