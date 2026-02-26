@@ -80,7 +80,7 @@ jobs:
           mv ${BINARY_NAME} ${OUTPUT_NAME}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: saltbox-facts-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/saltbox-facts-${{ matrix.arch }}
@@ -93,7 +93,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: saltbox-facts-*
