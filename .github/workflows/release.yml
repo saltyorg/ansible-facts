@@ -70,6 +70,9 @@ jobs:
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build Release Binary
+        env:
+          AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
+          CROSS_ENV_PASSTHROUGH: AWS_LC_SYS_NO_JITTER_ENTROPY
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Prepare binary
