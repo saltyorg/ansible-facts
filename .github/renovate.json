@@ -11,13 +11,16 @@
     "ansible": {
         "enabled": false
     },
-    "docker": {
-        "pinDigests": false
-    },
     "labels": [
         "dependencies"
     ],
     "packageRules": [
+        {
+            "matchCategories": [
+                "docker"
+            ],
+            "pinDigests": false
+        },
         {
             "description": "Major GitHub Actions updates",
             "matchManagers": [
@@ -64,17 +67,9 @@
         },
         {
             "description": "Major Rust crate updates",
-            "matchManagers": [
-                "cargo"
-            ],
-            "matchUpdateTypes": [
-                "major"
-            ],
-            "labels": [
-                "dependencies",
-                "rust",
-                "major"
-            ]
+            "matchManagers": ["cargo"],
+            "matchUpdateTypes": ["major"],
+            "labels": ["dependencies", "rust", "major"]
         }
     ],
     "rebaseWhen": "conflicted",
