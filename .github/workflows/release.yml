@@ -37,7 +37,7 @@ jobs:
             arch: armv5
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Set version from tag
         env:
