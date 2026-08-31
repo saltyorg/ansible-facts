@@ -1,8 +1,9 @@
 use reqwest::Client;
 use saltbox_facts::{
-    get_ip, get_timezone, has_valid_ipv6, ipv6_unavailable_error, parse_groups, parse_users,
-    sort_json_value, IpOutput, Output,
+    get_timezone, has_valid_ipv6, ipv6_unavailable_error, parse_groups, parse_users,
+    resolve_public_ips, sort_json_value, IpOutput, Output,
 };
+use std::ffi::OsStr;
 
 const IPV4_URLS: [&str; 2] = ["https://ipify.saltbox.dev", "https://ipv4.icanhazip.com"];
 const IPV6_URLS: [&str; 2] = ["https://ipify6.saltbox.dev", "https://ipv6.icanhazip.com"];
@@ -13,8 +14,33 @@ const ETC_TIMEZONE_PATH: &str = "/etc/timezone";
 const LOCALTIME_PATH: &str = "/etc/localtime";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionMode {
+    Facts,
+    Version,
+}
+
+fn execution_mode<I, S>(args: I) -> ExecutionMode
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut args = args.into_iter();
+    match (args.next(), args.next()) {
+        (Some(argument), None) if argument.as_ref() == OsStr::new("--version") => {
+            ExecutionMode::Version
+        }
+        _ => ExecutionMode::Facts,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if execution_mode(std::env::args_os().skip(1)) == ExecutionMode::Version {
+        println!("{VERSION}");
+        return Ok(());
+    }
+
     let client = Client::new();
 
     let groups_handle = tokio::task::spawn_blocking(|| parse_groups(GROUP_FILE_PATH));
@@ -24,18 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ip_future = async {
         let (ipv6_present, ipv6_check_error) = has_valid_ipv6(IF_INET6_FILE_PATH);
-        let ((ipv4, ipv4_error), (ipv6, ipv6_error)) = if ipv6_present {
-            tokio::join!(
-                get_ip(&client, &IPV4_URLS, false),
-                get_ip(&client, &IPV6_URLS, true)
-            )
-        } else {
-            let error = ipv6_unavailable_error(ipv6_check_error.as_deref());
-            (
-                get_ip(&client, &IPV4_URLS, false).await,
-                (None, Some(error)),
-            )
-        };
+        let unavailable_error = ipv6_unavailable_error(ipv6_check_error.as_deref());
+        let ((ipv4, ipv4_error), (ipv6, ipv6_error)) = resolve_public_ips(
+            &client,
+            &IPV4_URLS,
+            &IPV6_URLS,
+            ipv6_present,
+            unavailable_error,
+        )
+        .await;
         ((ipv4, ipv4_error), (ipv6, ipv6_error), ipv6_check_error)
     };
 
@@ -77,4 +100,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sorted_result = sort_json_value(serde_json::to_value(&result)?);
     println!("{}", serde_json::to_string(&sorted_result)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn execution_mode_selects_version_only_for_exact_version_argument() {
+        let cases = [
+            (Vec::<&str>::new(), ExecutionMode::Facts),
+            (vec!["--version"], ExecutionMode::Version),
+            (vec!["--version", "extra"], ExecutionMode::Facts),
+            (vec!["--unknown"], ExecutionMode::Facts),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(execution_mode(args), expected);
+        }
+    }
+
+    #[test]
+    fn non_utf8_unknown_argument_selects_facts_mode() {
+        let invalid_utf8 = OsString::from_vec(vec![0xff]);
+
+        assert_eq!(execution_mode([invalid_utf8]), ExecutionMode::Facts);
+    }
 }
