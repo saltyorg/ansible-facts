@@ -33,11 +33,29 @@ jobs:
             arch: armv6
 
           # Linux ARM v5 (MUSL - static binary)
-          - target: arm-unknown-linux-musleabi
+          - target: armv5te-unknown-linux-musleabi
             arch: armv5
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Validate architecture label
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "${ARCH}:${TARGET}" in
+            amd64:x86_64-unknown-linux-musl | \
+            arm64:aarch64-unknown-linux-musl | \
+            armv7:armv7-unknown-linux-musleabihf | \
+            armv6:arm-unknown-linux-musleabihf | \
+            armv5:armv5te-unknown-linux-musleabi)
+              ;;
+            *)
+              echo "Architecture label '${ARCH}' does not match target '${TARGET}'." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Set version from tag
         env:
@@ -77,10 +95,40 @@ jobs:
         run: cargo install cross --version 0.2.5 --locked
 
       - name: Build Release Binary
+        # Keep this cross-build workaround scoped to release artifacts instead
+        # of disabling AWS-LC CPU jitter entropy for native developer/CI builds.
         env:
           AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
-          CROSS_ENV_PASSTHROUGH: AWS_LC_SYS_NO_JITTER_ENTROPY
+          CROSS_BUILD_ENV_PASSTHROUGH: AWS_LC_SYS_NO_JITTER_ENTROPY
         run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Validate ARMv5 runtime compatibility
+        if: matrix.arch == 'armv5'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          fact_binary="${GITHUB_WORKSPACE}/target/${TARGET}/release/saltbox-facts"
+          output="$(
+            docker run --rm \
+              --entrypoint sh \
+              --volume "${fact_binary}:/tmp/saltbox-facts:ro" \
+              "ghcr.io/cross-rs/${TARGET}:0.2.5" \
+              -lc 'qemu-arm -cpu arm926 /tmp/saltbox-facts'
+          )"
+          case "$output" in
+            *'"saltbox_facts_version":'*) ;;
+            *)
+              echo "ARMv5 runtime check did not emit the version fact." >&2
+              exit 1
+              ;;
+          esac
+          case "$output" in
+            *'"ip":'*) ;;
+            *)
+              echo "ARMv5 runtime check did not emit the IP fact." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Prepare binary
         run: |
