@@ -2,6 +2,10 @@
 name = "saltbox-facts"
 version = "0.0.0-dev"
 edition = "2021"
+rust-version = "1.89"
+description = "Executable Ansible local facts for Saltbox hosts"
+repository = "https://github.com/saltyorg/ansible-facts"
+readme = "README.md"
 
 [profile.dev]
 opt-level = 0
