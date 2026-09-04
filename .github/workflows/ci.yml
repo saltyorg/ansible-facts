@@ -5,13 +5,16 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test
+  stable:
+    name: Stable Rust
     runs-on: ubuntu-latest
 
     steps:
@@ -28,8 +31,55 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      - name: Run debug tests
+        run: cargo test --all-targets --all-features --locked
+
+      - name: Run release tests
+        run: cargo test --release --all-targets --all-features --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+  msrv:
+    name: Rust 1.89.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.89.0
+        uses: dtolnay/rust-toolchain@1.89.0
+
       - name: Run tests
         run: cargo test --all-targets --all-features --locked
 
       - name: Build release binary
         run: cargo build --release --locked
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Actionlint with ShellCheck
+        run: |
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/repo" \
+            --workdir /repo \
+            rhysd/actionlint:1.7.12 \
+            -shellcheck=shellcheck
