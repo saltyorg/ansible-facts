@@ -47,17 +47,23 @@ retain the executable-local-fact behavior for compatibility.
 
 ## Public-address resolution
 
-IPv4 and IPv6 are resolved independently. Each round queries the configured
-sources concurrently and accepts the first globally routable unicast address
-returned. Source ordering does not determine which successful response wins,
-but all-failure diagnostics are rendered in configured source order. Private,
-shared, loopback, link-local, multicast, documentation, benchmarking, reserved,
-and other special-purpose addresses are rejected.
+IPv4 and IPv6 are resolved independently from these provider pairs:
+`https://ipify.saltbox.dev` and `https://ipv4.icanhazip.com` for IPv4, and
+`https://ipify6.saltbox.dev` and `https://ipv6.icanhazip.com` for IPv6. Each
+round queries both configured sources concurrently and accepts the first
+successful response. Source ordering does not determine which successful
+response wins, but all-failure diagnostics are rendered in configured source
+order.
 
-IPv6 allocation status follows the
-[IANA IPv6 Global Unicast Address Space registry](https://www.iana.org/assignments/ipv6-unicast-address-assignments).
-Unlisted portions of `2000::/3` are reserved and rejected; update the predicate
-and its allocation-boundary tests when that registry changes.
+The first-party endpoint returns the source address observed by Traefik, while
+icanhazip observes the source address of its connection. Either can therefore
+report the address after NAT or through a proxy, depending on the network path.
+Responses are accepted when they are valid syntax for the requested IP family
+and are returned in canonical form. Providers are availability sources rather
+than an address-consensus system: the local `/proc/net/if_inet6` check only
+gates whether IPv6 attempts are made. No LAN or IANA denylist is applied,
+because an echo service's observation—not registry classification—is the
+boundary this fact needs to report.
 
 A failed round is retried twice, for at most three complete rounds. Requests
 have a three-second timeout, with 250 ms and 750 ms delays before the second and

@@ -518,80 +518,18 @@ pub fn validate_ip(ip: &str, is_ipv6: bool) -> bool {
 }
 
 fn canonical_public_ip(ip: &str, is_ipv6: bool) -> Option<String> {
+    // Echo services report what a request looks like at their boundary; they
+    // are availability sources, not a consensus system. Trust syntax and the
+    // requested family instead of trying to maintain a LAN/IANA denylist.
+    let ip = ip.trim();
     if is_ipv6 {
         ip.parse::<Ipv6Addr>()
             .ok()
-            .filter(|address| is_public_ipv6(*address))
             .map(|address| address.to_string())
     } else {
         ip.parse::<Ipv4Addr>()
             .ok()
-            .filter(|address| is_public_ipv4(*address))
             .map(|address| address.to_string())
-    }
-}
-
-fn is_public_ipv4(address: Ipv4Addr) -> bool {
-    let [first, second, third, fourth] = address.octets();
-    let shared = first == 100 && second & 0b1100_0000 == 0b0100_0000;
-    let protocol_assignment =
-        first == 192 && second == 0 && third == 0 && fourth != 9 && fourth != 10;
-    let benchmarking = first == 198 && matches!(second, 18 | 19);
-    let reserved = first >= 240;
-
-    first != 0
-        && !address.is_private()
-        && !shared
-        && !address.is_loopback()
-        && !address.is_link_local()
-        && !protocol_assignment
-        && !address.is_documentation()
-        && !benchmarking
-        && !address.is_multicast()
-        && !reserved
-        && !address.is_broadcast()
-}
-
-fn is_public_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    let raw = u128::from_be_bytes(address.octets());
-    let allocated_global_unicast = is_allocated_global_unicast(segments);
-    let ietf_protocol_assignment = segments[0] == 0x2001 && segments[1] < 0x0200;
-    // IANA-maintained globally reachable anycast addresses within 2001::/23.
-    let ietf_global_exception = raw == 0x2001_0001_0000_0000_0000_0000_0000_0001
-        || raw == 0x2001_0001_0000_0000_0000_0000_0000_0002
-        || raw == 0x2001_0001_0000_0000_0000_0000_0000_0003
-        || matches!(segments, [0x2001, 3, ..])
-        || matches!(segments, [0x2001, 4, 0x0112, ..])
-        || matches!(segments, [0x2001, second, ..] if (0x20..=0x3f).contains(&second));
-    let documentation = matches!(segments, [0x2001, 0x0db8, ..]) || segments[0] & 0xfff0 == 0x3ff0;
-
-    allocated_global_unicast
-        && (!ietf_protocol_assignment || ietf_global_exception)
-        && !documentation
-}
-
-fn is_allocated_global_unicast(segments: [u16; 8]) -> bool {
-    let [first, second, ..] = segments;
-    match first {
-        0x2001 => matches!(
-            second,
-            0x0000..=0x0fff
-                | 0x1200..=0x3fff
-                | 0x4000..=0x4dff
-                | 0x5000..=0x5fff
-                | 0x8000..=0x9fff
-                | 0xa000..=0xbfff
-        ),
-        0x2003 => second <= 0x3fff,
-        first if first & 0xffe0 == 0x2400 => true,
-        first if first & 0xfff0 == 0x2600 => true,
-        0x2610 | 0x2620 => second <= 0x01ff,
-        first if first & 0xfff0 == 0x2630 => true,
-        first if first & 0xfff0 == 0x2800 => true,
-        first if first & 0xffe0 == 0x2a00 => true,
-        first if first & 0xfff0 == 0x2c00 => true,
-        _ => false,
     }
 }
 
@@ -1916,85 +1854,39 @@ fe800000000000000000000000000002 03 40 20 80 eth1
         assert!(!has_global_ipv6_from_if_inet6("not enough fields\n1234\n"));
     }
 
-    #[test]
-    fn accepts_only_globally_routable_unicast_addresses() {
-        for address in [
-            "0.0.0.0",
-            "10.0.0.1",
-            "100.64.0.1",
-            "127.0.0.1",
-            "169.254.0.1",
-            "192.0.2.1",
-            "198.18.0.1",
-            "224.0.0.1",
-            "240.0.0.1",
-            "255.255.255.255",
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_echo_responses_accept_syntax_and_family_only() {
+        for (address, is_ipv6, canonical) in [
+            (" 10.0.0.1\n", false, "10.0.0.1"),
+            ("192.88.99.1", false, "192.88.99.1"),
+            ("192.88.99.2", false, "192.88.99.2"),
+            ("192.0.2.1", false, "192.0.2.1"),
+            ("::1", true, "::1"),
+            ("2001:db8::1", true, "2001:db8::1"),
         ] {
-            assert!(!validate_ip(address, false), "accepted IPv4 {address}");
-        }
-        assert!(validate_ip("1.1.1.1", false));
-        assert!(!validate_ip("1.1.1.1", true));
+            let server = TestHttpServer::start(move |_| ("200 OK", address, Duration::ZERO));
+            let urls = server_urls(&[&server]);
+            let urls = url_refs(&urls);
 
-        for address in [
-            "::",
-            "::1",
-            "::ffff:192.0.2.1",
-            "100::1",
-            "2000::1",
-            "2001:2::1",
-            "2001:db8::1",
-            "2001:1000::1",
-            "2001:4e00::1",
-            "2001:6000::1",
-            "2001:c000::1",
-            "2002::1",
-            "2003:4000::1",
-            "2004::1",
-            "2200::1",
-            "2420::1",
-            "2610:200::1",
-            "2611::1",
-            "2620:200::1",
-            "2621::1",
-            "2640::1",
-            "2810::1",
-            "2a20::1",
-            "2c10::1",
-            "2d00::1",
-            "2e00::1",
-            "3000::1",
-            "3800::1",
-            "3c00::1",
-            "3e00::1",
-            "3f00::1",
-            "3f80::1",
-            "3fc0::1",
-            "3fe0::1",
-            "3ff0::1",
-            "3ff8::1",
-            "3ffc::1",
-            "3ffe::1",
-            "3fff::1",
-            "5f00::1",
-            "fc00::1",
-            "fe80::1",
-            "ff0e::1",
-        ] {
-            assert!(!validate_ip(address, true), "accepted IPv6 {address}");
+            assert_eq!(
+                get_ip(&Client::new(), &urls, is_ipv6).await,
+                (Some(canonical.to_string()), None),
+                "rejected trusted {address} response"
+            );
         }
-        for address in [
-            "2001:1::3",
-            "2001:4860:4860::8888",
-            "2003::1",
-            "2404:6800:4003::200e",
-            "2606:4700:4700::1111",
-            "2804::1",
-            "2a00::1",
-            "2c0f::1",
-        ] {
-            assert!(validate_ip(address, true), "rejected IPv6 {address}");
+
+        for (address, is_ipv6) in [("not an address", false), ("10.0.0.1", true)] {
+            let server = TestHttpServer::start(move |_| ("200 OK", address, Duration::ZERO));
+            let urls = server_urls(&[&server]);
+            let urls = url_refs(&urls);
+
+            let (result, error) = get_ip(&Client::new(), &urls, is_ipv6).await;
+            assert_eq!(result, None, "accepted invalid {address} response");
+            assert!(
+                error.is_some(),
+                "missing error for invalid {address} response"
+            );
         }
-        assert!(!validate_ip("2606:4700:4700::1111", false));
     }
 
     #[test]
