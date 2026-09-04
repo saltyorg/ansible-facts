@@ -29,6 +29,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.8.2"
+tempfile = "3.27.0"
 
 [[bench]]
 name = "local_paths"

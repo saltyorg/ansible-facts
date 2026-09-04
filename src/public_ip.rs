@@ -36,6 +36,8 @@ struct LookupPolicy<'a> {
     cache_path: &'a Path,
     now: u64,
     retry_delays: [Duration; 2],
+    request_timeout: Duration,
+    cache_lock_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -68,6 +70,15 @@ pub async fn get_ip(
     urls: &[&str],
     is_ipv6: bool,
 ) -> (Option<String>, Option<String>) {
+    get_ip_with_timeout(client, urls, is_ipv6, REQUEST_TIMEOUT).await
+}
+
+async fn get_ip_with_timeout(
+    client: &Client,
+    urls: &[&str],
+    is_ipv6: bool,
+    request_timeout: Duration,
+) -> (Option<String>, Option<String>) {
     if urls.is_empty() {
         return (
             None,
@@ -79,7 +90,12 @@ pub async fn get_ip(
     let mut requests = FuturesUnordered::new();
 
     for (index, &url) in urls.iter().enumerate() {
-        requests.push(async move { (index, fetch_ip_from_url(client, url, is_ipv6).await) });
+        requests.push(async move {
+            (
+                index,
+                fetch_ip_from_url(client, url, is_ipv6, request_timeout).await,
+            )
+        });
     }
 
     while let Some((index, result)) = requests.next().await {
@@ -98,16 +114,17 @@ pub async fn get_ip(
     (None, Some(combined_error))
 }
 
-async fn get_ip_with_retry(
+async fn get_ip_with_retry_with_timeout(
     client: &Client,
     urls: &[&str],
     is_ipv6: bool,
     retry_delays: [Duration; 2],
+    request_timeout: Duration,
 ) -> (Option<String>, Option<String>) {
     let mut attempt_errors = Vec::with_capacity(3);
 
     for attempt in 0..3 {
-        let (address, error) = get_ip(client, urls, is_ipv6).await;
+        let (address, error) = get_ip_with_timeout(client, urls, is_ipv6, request_timeout).await;
         if address.is_some() {
             return (address, None);
         }
@@ -146,6 +163,8 @@ pub async fn resolve_public_ips(
             cache_path: Path::new(PUBLIC_IP_CACHE_PATH),
             now,
             retry_delays: RETRY_DELAYS,
+            request_timeout: REQUEST_TIMEOUT,
+            cache_lock_timeout: CACHE_LOCK_TIMEOUT,
         },
     )
     .await
@@ -179,7 +198,14 @@ async fn resolve_public_ips_with_policy(
         match cached_ipv4 {
             Some(address) => ((Some(address), None), None),
             None => {
-                let result = get_ip_with_retry(client, ipv4_urls, false, policy.retry_delays).await;
+                let result = get_ip_with_retry_with_timeout(
+                    client,
+                    ipv4_urls,
+                    false,
+                    policy.retry_delays,
+                    policy.request_timeout,
+                )
+                .await;
                 let live_address = result.0.clone();
                 (result, live_address)
             }
@@ -192,7 +218,14 @@ async fn resolve_public_ips_with_policy(
         match cached_ipv6 {
             Some(address) => ((Some(address), None), None),
             None => {
-                let result = get_ip_with_retry(client, ipv6_urls, true, policy.retry_delays).await;
+                let result = get_ip_with_retry_with_timeout(
+                    client,
+                    ipv6_urls,
+                    true,
+                    policy.retry_delays,
+                    policy.request_timeout,
+                )
+                .await;
                 let live_address = result.0.clone();
                 (result, live_address)
             }
@@ -205,7 +238,13 @@ async fn resolve_public_ips_with_policy(
     if live_ipv4.is_some() || live_ipv6.is_some() {
         let cache_path = policy.cache_path.to_path_buf();
         let _ = tokio::task::spawn_blocking(move || {
-            merge_successful_cache_entries(&cache_path, live_ipv4, live_ipv6, policy.now)
+            merge_successful_cache_entries_with_timeout(
+                &cache_path,
+                live_ipv4,
+                live_ipv6,
+                policy.now,
+                policy.cache_lock_timeout,
+            )
         })
         .await;
     }
@@ -272,18 +311,19 @@ fn canonical_cache_entry(mut entry: CacheEntry, is_ipv6: bool) -> Option<CacheEn
     Some(entry)
 }
 
-fn merge_successful_cache_entries(
+fn merge_successful_cache_entries_with_timeout(
     cache_path: &Path,
     live_ipv4: Option<String>,
     live_ipv6: Option<String>,
     now: u64,
+    cache_lock_timeout: Duration,
 ) -> io::Result<()> {
     let parent = cache_path
         .parent()
         .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
     ensure_cache_parent(cache_path)?;
     let lock_path = parent.join(CACHE_LOCK_FILE_NAME);
-    let lock_file = acquire_cache_lock(&lock_path)?;
+    let lock_file = acquire_cache_lock(&lock_path, cache_lock_timeout)?;
 
     let mut cache = cache_for_update(load_cache(cache_path));
     if let Some(address) = live_ipv4 {
@@ -385,7 +425,7 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(directory)
 }
 
-fn acquire_cache_lock(lock_path: &Path) -> io::Result<File> {
+fn acquire_cache_lock(lock_path: &Path, lock_timeout: Duration) -> io::Result<File> {
     let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -405,13 +445,13 @@ fn acquire_cache_lock(lock_path: &Path) -> io::Result<File> {
             Ok(()) => return Ok(lock_file),
             Err(TryLockError::WouldBlock) => {
                 let elapsed = started.elapsed();
-                if elapsed >= CACHE_LOCK_TIMEOUT {
+                if elapsed >= lock_timeout {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out acquiring cache lock",
                     ));
                 }
-                std::thread::sleep(CACHE_LOCK_RETRY_DELAY.min(CACHE_LOCK_TIMEOUT - elapsed));
+                std::thread::sleep(CACHE_LOCK_RETRY_DELAY.min(lock_timeout - elapsed));
             }
             Err(TryLockError::Error(error)) => return Err(error),
         }
@@ -466,9 +506,14 @@ fn unique_cache_temp_path(parent: &Path) -> PathBuf {
     parent.join(format!(".public-ip.{}.{unique}.tmp", std::process::id()))
 }
 
-async fn fetch_ip_from_url(client: &Client, url: &str, is_ipv6: bool) -> Result<String, String> {
+async fn fetch_ip_from_url(
+    client: &Client,
+    url: &str,
+    is_ipv6: bool,
+    request_timeout: Duration,
+) -> Result<String, String> {
     let ip_label = if is_ipv6 { "IPv6" } else { "IPv4" };
-    match timeout(REQUEST_TIMEOUT, async {
+    match timeout(request_timeout, async {
         let response = client
             .get(url)
             .send()
@@ -507,9 +552,17 @@ async fn fetch_ip_from_url(client: &Client, url: &str, is_ipv6: bool) -> Result<
     {
         Ok(result) => result,
         Err(_) => Err(format!(
-            "Timeout after {}s for {url}",
-            REQUEST_TIMEOUT.as_secs()
+            "Timeout after {} for {url}",
+            format_timeout(request_timeout)
         )),
+    }
+}
+
+fn format_timeout(timeout: Duration) -> String {
+    if timeout.subsec_nanos() == 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{}ms", timeout.as_millis())
     }
 }
 
@@ -570,7 +623,6 @@ pub fn has_global_ipv6_from_if_inet6(content: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::env;
     use std::fs;
     use std::io::{BufRead, BufReader as StdBufReader, Write};
     use std::net::{TcpListener, TcpStream};
@@ -578,30 +630,31 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
-
-    static TEST_PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    use tempfile::TempDir;
 
     struct TestDirectory {
-        path: PathBuf,
+        directory: TempDir,
     }
 
     impl TestDirectory {
         fn new() -> Self {
-            let unique = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = env::temp_dir().join(format!(
-                "saltbox-facts-test-{}-{unique}",
-                std::process::id()
-            ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            Self { path }
+            let directory = tempfile::Builder::new()
+                .prefix("saltbox-facts-test-")
+                .tempdir()
+                .unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            Self { directory }
+        }
+
+        fn path(&self) -> &Path {
+            self.directory.path()
         }
 
         fn cache_path(&self) -> PathBuf {
-            let namespace = self.path.join("saltbox");
+            let namespace = self.path().join("saltbox");
             let cache_directory = namespace.join("facts");
             if !namespace.exists() {
                 fs::create_dir(&namespace).unwrap();
@@ -620,12 +673,6 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.path).unwrap();
-        }
-    }
-
     struct TestHttpServer {
         url: String,
         requests: Arc<AtomicUsize>,
@@ -638,6 +685,15 @@ mod tests {
         where
             F: Fn(usize) -> (&'static str, &'static str, Duration) + Send + Sync + 'static,
         {
+            Self::start_with_handler(move |stream, request_number| {
+                handle_test_request(stream, response(request_number));
+            })
+        }
+
+        fn start_with_handler<F>(handler: F) -> Self
+        where
+            F: Fn(TcpStream, usize) + Send + Sync + 'static,
+        {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
@@ -645,13 +701,13 @@ mod tests {
             let shutdown = Arc::new(AtomicBool::new(false));
             let thread_requests = Arc::clone(&requests);
             let thread_shutdown = Arc::clone(&shutdown);
-            let response = Arc::new(response);
+            let handler = Arc::new(handler);
             let server_thread = thread::spawn(move || {
                 while !thread_shutdown.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let request_number = thread_requests.fetch_add(1, Ordering::SeqCst) + 1;
-                            handle_test_request(stream, response(request_number));
+                            handler(stream, request_number);
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(1));
@@ -693,12 +749,52 @@ mod tests {
             }
         }
         thread::sleep(delay);
-        write!(
+        if let Err(error) = write!(
             stream,
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
-        )
-        .unwrap();
+        ) {
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        }
+    }
+
+    fn handle_raw_test_request(
+        mut stream: TcpStream,
+        status: &str,
+        headers: &[(&str, &str)],
+        body_chunks: &[&[u8]],
+        delay: Duration,
+    ) {
+        let mut reader = StdBufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        thread::sleep(delay);
+        write!(stream, "HTTP/1.1 {status}\r\nConnection: close\r\n").unwrap();
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").unwrap();
+        }
+        write!(stream, "\r\n").unwrap();
+
+        let chunked = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("Transfer-Encoding") && *value == "chunked"
+        });
+        for chunk in body_chunks {
+            if chunked {
+                write!(stream, "{:X}\r\n", chunk.len()).unwrap();
+            }
+            stream.write_all(chunk).unwrap();
+            if chunked {
+                stream.write_all(b"\r\n").unwrap();
+            }
+        }
+        if chunked {
+            stream.write_all(b"0\r\n\r\n").unwrap();
+        }
     }
 
     fn server_urls(servers: &[&TestHttpServer]) -> Vec<String> {
@@ -714,7 +810,123 @@ mod tests {
             cache_path,
             now,
             retry_delays: [Duration::ZERO, Duration::ZERO],
+            request_timeout: Duration::from_millis(25),
+            cache_lock_timeout: Duration::from_millis(25),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn declared_response_size_over_64_bytes_is_rejected_before_reading_body() {
+        // Catches removal of the Content-Length boundary check.
+        let server = TestHttpServer::start_with_handler(|stream, _| {
+            handle_raw_test_request(
+                stream,
+                "200 OK",
+                &[("Content-Length", "65")],
+                &[b"8.8.8.8"],
+                Duration::ZERO,
+            );
+        });
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let (address, error) = get_ip(&Client::new(), &urls, false).await;
+
+        assert_eq!(address, None);
+        assert!(error.unwrap().contains("exceeded 64 bytes"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_response_over_64_bytes_is_rejected_after_streaming_body() {
+        // Catches removal of aggregate byte enforcement for unknown-length streams.
+        let first_chunk = [b' '; 64];
+        let server = TestHttpServer::start_with_handler(move |stream, _| {
+            handle_raw_test_request(
+                stream,
+                "200 OK",
+                &[("Transfer-Encoding", "chunked")],
+                &[&first_chunk, b"x"],
+                Duration::ZERO,
+            );
+        });
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let (address, error) = get_ip(&Client::new(), &urls, false).await;
+
+        assert_eq!(address, None);
+        assert!(error.unwrap().contains("exceeded 64 bytes"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_utf8_response_body_is_rejected() {
+        // Catches lossy response decoding that could turn invalid bytes into accepted text.
+        let server = TestHttpServer::start_with_handler(|stream, _| {
+            handle_raw_test_request(
+                stream,
+                "200 OK",
+                &[("Content-Length", "7")],
+                &[b"8.8.8.\xff"],
+                Duration::ZERO,
+            );
+        });
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let (address, error) = get_ip(&Client::new(), &urls, false).await;
+
+        assert_eq!(address, None);
+        assert!(error.unwrap().contains("not valid UTF-8"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_success_status_is_rejected_without_accepting_its_body() {
+        // Catches accepting a syntactically valid body without enforcing HTTP success.
+        let server =
+            TestHttpServer::start(|_| ("503 Service Unavailable", "8.8.8.8", Duration::ZERO));
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let (address, error) = get_ip(&Client::new(), &urls, false).await;
+
+        assert_eq!(address, None);
+        assert!(error.unwrap().contains("HTTP 503"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_with_wrong_address_family_is_rejected() {
+        // Catches accepting any parseable address instead of the requested family.
+        let server = TestHttpServer::start(|_| ("200 OK", "2606:4700:4700::1111", Duration::ZERO));
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let (address, error) = get_ip(&Client::new(), &urls, false).await;
+
+        assert_eq!(address, None);
+        assert!(error.unwrap().contains("Invalid IPv4 address"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_timeout_uses_the_private_millisecond_policy() {
+        // Catches hard-coding the three-second production timeout in resolver calls.
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.8.8", Duration::from_millis(100)));
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let (ipv4, _) = resolve_public_ips_with_policy(
+            &Client::new(),
+            &urls,
+            &[],
+            false,
+            "IPv6 unavailable".to_string(),
+            test_lookup_policy(&cache_path, 1_780_001_000),
+        )
+        .await;
+
+        assert_eq!(ipv4.0, None);
+        assert!(ipv4.1.unwrap().contains("Timeout after 25ms"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -726,11 +938,12 @@ mod tests {
         let urls = server_urls(&[&failure, &success]);
         let urls = url_refs(&urls);
 
-        let result = get_ip_with_retry(
+        let result = get_ip_with_retry_with_timeout(
             &Client::new(),
             &urls,
             false,
             [Duration::ZERO, Duration::ZERO],
+            REQUEST_TIMEOUT,
         )
         .await;
 
@@ -755,11 +968,12 @@ mod tests {
         let urls = server_urls(&[&first, &second, &succeeds_on_third]);
         let urls = url_refs(&urls);
 
-        let result = get_ip_with_retry(
+        let result = get_ip_with_retry_with_timeout(
             &Client::new(),
             &urls,
             false,
             [Duration::ZERO, Duration::ZERO],
+            REQUEST_TIMEOUT,
         )
         .await;
 
@@ -778,11 +992,12 @@ mod tests {
         let urls = server_urls(&[&first, &second]);
         let urls = url_refs(&urls);
 
-        let (address, error) = get_ip_with_retry(
+        let (address, error) = get_ip_with_retry_with_timeout(
             &Client::new(),
             &urls,
             false,
             [Duration::ZERO, Duration::ZERO],
+            REQUEST_TIMEOUT,
         )
         .await;
 
@@ -799,13 +1014,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn failure_diagnostics_follow_configured_source_order() {
-        let configured_first = TestHttpServer::start(|_| {
-            (
-                "503 Service Unavailable",
-                "first",
-                Duration::from_millis(20),
-            )
-        });
+        let configured_first =
+            TestHttpServer::start(|_| ("503 Service Unavailable", "first", Duration::ZERO));
         let configured_second =
             TestHttpServer::start(|_| ("500 Internal Server Error", "second", Duration::ZERO));
         let urls = server_urls(&[&configured_first, &configured_second]);
@@ -823,15 +1033,33 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn first_valid_source_wins_even_when_configured_later() {
-        let configured_first =
-            TestHttpServer::start(|_| ("200 OK", "1.1.1.1", Duration::from_millis(20)));
+        let (first_received_sender, first_received) = mpsc::sync_channel(1);
+        let (release_first, release_first_receiver) = mpsc::sync_channel(1);
+        let release_first_receiver = Arc::new(Mutex::new(release_first_receiver));
+        let configured_first = TestHttpServer::start_with_handler(move |stream, _| {
+            first_received_sender.send(()).unwrap();
+            release_first_receiver.lock().unwrap().recv().unwrap();
+            handle_test_request(stream, ("200 OK", "1.1.1.1", Duration::ZERO));
+        });
         let faster_second = TestHttpServer::start(|_| ("200 OK", "8.8.8.8", Duration::ZERO));
         let urls = server_urls(&[&configured_first, &faster_second]);
-        let urls = url_refs(&urls);
+        let lookup = tokio::spawn(async move {
+            let urls = url_refs(&urls);
+            get_ip(&Client::new(), &urls, false).await
+        });
 
-        let result = get_ip(&Client::new(), &urls, false).await;
+        tokio::task::spawn_blocking(move || {
+            first_received
+                .recv_timeout(Duration::from_secs(1))
+                .expect("configured first source did not receive its request")
+        })
+        .await
+        .unwrap();
+        let result = lookup.await.unwrap();
+        release_first.send(()).unwrap();
 
         assert_eq!(result, (Some("8.8.8.8".to_string()), None));
+        assert_eq!(configured_first.request_count(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -896,7 +1124,7 @@ mod tests {
             ("group-readable file", 0o700, 0o640),
         ] {
             let directory = TestDirectory::new();
-            let namespace = directory.path.join("saltbox");
+            let namespace = directory.path().join("saltbox");
             let cache_directory = namespace.join("facts");
             let cache_path = cache_directory.join("public-ip.json");
             fs::create_dir(&namespace).unwrap();
@@ -950,7 +1178,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn writable_cache_namespace_is_ignored_without_mutation() {
         let directory = TestDirectory::new();
-        let namespace = directory.path.join("saltbox");
+        let namespace = directory.path().join("saltbox");
         let cache_directory = namespace.join("facts");
         let cache_path = cache_directory.join("public-ip.json");
         fs::create_dir(&namespace).unwrap();
@@ -990,7 +1218,7 @@ mod tests {
     #[test]
     fn cache_metadata_owned_by_another_user_is_rejected() {
         let directory = TestDirectory::new();
-        let metadata = fs::metadata(&directory.path).unwrap();
+        let metadata = fs::metadata(directory.path()).unwrap();
         let other_user = metadata.uid().wrapping_add(1);
 
         let error = validate_owner(&metadata, other_user).unwrap_err();
@@ -1001,7 +1229,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn missing_cache_directory_is_recreated_and_populated() {
         let directory = TestDirectory::new();
-        let cache_directory = directory.path.join("saltbox").join("facts");
+        let cache_directory = directory.path().join("saltbox").join("facts");
         let cache_path = cache_directory.join("public-ip.json");
         let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.80", Duration::from_millis(5)));
         let ipv4_urls = server_urls(&[&server]);
@@ -1030,8 +1258,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn symlink_cache_directory_is_a_soft_write_failure() {
         let directory = TestDirectory::new();
-        let cache_namespace = directory.path.join("saltbox");
-        let redirected_directory = directory.path.join("redirected");
+        let cache_namespace = directory.path().join("saltbox");
+        let redirected_directory = directory.path().join("redirected");
         fs::create_dir(&cache_namespace).unwrap();
         fs::create_dir(&redirected_directory).unwrap();
         let cache_directory = cache_namespace.join("facts");
@@ -1062,8 +1290,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fresh_cache_behind_symlinked_facts_directory_is_ignored() {
         let directory = TestDirectory::new();
-        let cache_namespace = directory.path.join("saltbox");
-        let redirected_directory = directory.path.join("redirected");
+        let cache_namespace = directory.path().join("saltbox");
+        let redirected_directory = directory.path().join("redirected");
         fs::create_dir(&cache_namespace).unwrap();
         fs::create_dir(&redirected_directory).unwrap();
         let cache_directory = cache_namespace.join("facts");
@@ -1101,11 +1329,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn fresh_cache_behind_symlinked_namespace_is_ignored() {
         let directory = TestDirectory::new();
-        let redirected_namespace = directory.path.join("redirected");
+        let redirected_namespace = directory.path().join("redirected");
         let redirected_directory = redirected_namespace.join("facts");
         fs::create_dir(&redirected_namespace).unwrap();
         fs::create_dir(&redirected_directory).unwrap();
-        let cache_namespace = directory.path.join("saltbox");
+        let cache_namespace = directory.path().join("saltbox");
         symlink(&redirected_namespace, &cache_namespace).unwrap();
         let cache_path = cache_namespace.join("facts").join("public-ip.json");
         let redirected_cache_path = redirected_directory.join("public-ip.json");
@@ -1140,7 +1368,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn recreated_cache_hierarchy_uses_saltbox_directory_modes() {
         let directory = TestDirectory::new();
-        let cache_namespace = directory.path.join("saltbox");
+        let cache_namespace = directory.path().join("saltbox");
         let cache_directory = cache_namespace.join("facts");
         let cache_path = cache_directory.join("public-ip.json");
         let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.82", Duration::from_millis(5)));
@@ -1497,36 +1725,44 @@ mod tests {
         lock_file.try_lock().unwrap();
 
         let start = Arc::new(Barrier::new(3));
+        let (started_sender, started_receiver) = mpsc::sync_channel(2);
         let ipv4_cache_path = cache_path.clone();
         let ipv4_start = Arc::clone(&start);
+        let ipv4_started = started_sender.clone();
         let ipv4_writer = thread::spawn(move || {
             let snapshot = load_cache(&ipv4_cache_path).unwrap();
             assert_eq!(snapshot.ipv4.unwrap().address, "8.8.4.10");
             ipv4_start.wait();
-            merge_successful_cache_entries(
+            ipv4_started.send(()).unwrap();
+            merge_successful_cache_entries_with_timeout(
                 &ipv4_cache_path,
                 Some("8.8.4.11".to_string()),
                 None,
                 now,
+                CACHE_LOCK_TIMEOUT,
             )
         });
 
         let ipv6_cache_path = cache_path.clone();
         let ipv6_start = Arc::clone(&start);
+        let ipv6_started = started_sender.clone();
         let ipv6_writer = thread::spawn(move || {
             let snapshot = load_cache(&ipv6_cache_path).unwrap();
             assert_eq!(snapshot.ipv6.unwrap().address, "2606:4700:4700::10");
             ipv6_start.wait();
-            merge_successful_cache_entries(
+            ipv6_started.send(()).unwrap();
+            merge_successful_cache_entries_with_timeout(
                 &ipv6_cache_path,
                 None,
                 Some("2606:4700:4700::11".to_string()),
                 now,
+                CACHE_LOCK_TIMEOUT,
             )
         });
 
         start.wait();
-        thread::sleep(Duration::from_millis(50));
+        started_receiver.recv().unwrap();
+        started_receiver.recv().unwrap();
         let while_locked: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
         assert_eq!(while_locked, old_cache);
@@ -1605,11 +1841,8 @@ mod tests {
 
         let ((ipv4, _), elapsed) = received.expect("lock acquisition must time out");
         assert_eq!(ipv4, (Some("8.8.4.21".to_string()), None));
-        assert!(elapsed >= Duration::from_secs(1), "elapsed: {elapsed:?}");
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "elapsed: {elapsed:?}"
-        );
+        assert!(elapsed >= Duration::from_millis(25), "elapsed: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
         assert_eq!(fs::read_to_string(&cache_path).unwrap(), original_cache);
         assert_eq!(server.request_count(), 1);
     }
@@ -1670,7 +1903,7 @@ mod tests {
                     .unwrap()
                     .success()),
                 "symlink" => {
-                    let target = directory.path.join("lock-target");
+                    let target = directory.path().join("lock-target");
                     fs::write(&target, "do not touch").unwrap();
                     symlink(&target, &lock_path).unwrap();
                 }
