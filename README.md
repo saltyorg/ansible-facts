@@ -19,6 +19,7 @@ Running the binary without arguments prints one JSON object to standard output:
 {
   "groups": {},
   "ip": {
+    "cache_warning": null,
     "error_ipv4": null,
     "error_ipv6": null,
     "failed_ipv4": false,
@@ -39,7 +40,9 @@ Object keys are emitted in deterministic alphabetical order. A public-address
 failure is represented inside the JSON rather than as a process failure:
 `failed_ipv4` or `failed_ipv6` is `true`, the corresponding address is empty,
 and the error field explains the failed attempts. Failures reading mandatory
-local account files still make the process fail.
+local account files still make the process fail. Nonfatal cache problems are
+reported in `cache_warning`; the field is always present and is `null` when no
+warning occurred.
 
 `saltbox-facts --version` prints only the compiled semantic version and exits
 before filesystem, cache, or network work. Unknown or additional arguments
@@ -89,7 +92,13 @@ JSON, unsupported schemas, future timestamps, expired entries, and addresses
 from the wrong family. Writers take a bounded advisory lock, reload and merge
 under that lock, atomically rename a same-directory temporary file, and sync
 the file and directory. Cache failures remain soft: a live lookup result is
-still returned, but an untrusted cache is never used.
+still returned, but an untrusted cache is never used. Missing and expired
+entries are normal cache misses and do not produce warnings. Invalid or unsafe
+reads use the `cache read ignored: ` prefix; lock, directory, write, rename,
+sync, and blocking-task failures during persistence use `cache write skipped: `.
+When both phases warn, the read warning appears first and the phases are joined
+with ` | `. Valid IPv4 and IPv6 entries remain independent when only the other
+family's entry is invalid.
 
 ## Development
 

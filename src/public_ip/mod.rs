@@ -71,10 +71,11 @@ async fn resolve_public_ips_with_policy(
     policy: LookupPolicy<'_>,
 ) -> PublicIpResolution {
     let cache_path = policy.cache_path.to_path_buf();
-    let loaded_cache = tokio::task::spawn_blocking(move || cache::load(&cache_path))
-        .await
-        .ok()
-        .flatten();
+    let (loaded_cache, cache_read_warnings) =
+        match tokio::task::spawn_blocking(move || cache::load(&cache_path, policy.now)).await {
+            Ok(result) => (result.cache, result.warnings),
+            Err(error) => (None, vec![format!("cache read task failed: {error}")]),
+        };
     let cached_ipv4 = loaded_cache
         .as_ref()
         .and_then(|cache| cache::fresh_address(cache, AddressFamily::Ipv4, policy.now));
@@ -102,11 +103,11 @@ async fn resolve_public_ips_with_policy(
 
     let (ipv4, ipv6) = tokio::join!(ipv4_future, ipv6_future);
 
-    if ipv4.live_address.is_some() || ipv6.live_address.is_some() {
+    let cache_write_warning = if ipv4.live_address.is_some() || ipv6.live_address.is_some() {
         let cache_path = policy.cache_path.to_path_buf();
         let live_ipv4 = ipv4.live_address;
         let live_ipv6 = ipv6.live_address;
-        let _ = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             cache::merge_successful_entries_with_timeout(
                 &cache_path,
                 live_ipv4,
@@ -115,14 +116,38 @@ async fn resolve_public_ips_with_policy(
                 policy.cache_lock_timeout,
             )
         })
-        .await;
-    }
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("cache write task failed: {error}")),
+        }
+    } else {
+        None
+    };
 
     PublicIpResolution {
         ipv4: ipv4.outcome,
         ipv6: ipv6.outcome,
-        cache_warning: None,
+        cache_warning: aggregate_cache_warnings(cache_read_warnings, cache_write_warning),
     }
+}
+
+fn aggregate_cache_warnings(
+    cache_read_warnings: Vec<String>,
+    cache_write_warning: Option<String>,
+) -> Option<String> {
+    let mut phases = Vec::with_capacity(2);
+    if !cache_read_warnings.is_empty() {
+        phases.push(format!(
+            "cache read ignored: {}",
+            cache_read_warnings.join("; ")
+        ));
+    }
+    if let Some(warning) = cache_write_warning {
+        phases.push(format!("cache write skipped: {warning}"));
+    }
+    (!phases.is_empty()).then(|| phases.join(" | "))
 }
 
 async fn resolve_family(

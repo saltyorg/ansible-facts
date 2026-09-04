@@ -80,6 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = Output {
         saltbox_facts_version: VERSION,
         ip: IpOutput {
+            cache_warning: resolution.cache_warning,
             public_ip: resolution.ipv4.address.unwrap_or_default(),
             public_ipv6: resolution.ipv6.address.unwrap_or_default(),
             error_ipv4: resolution.ipv4.error,

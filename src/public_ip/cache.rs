@@ -1,7 +1,9 @@
 use super::address::{canonical_public_ip, AddressFamily};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
+use std::net::IpAddr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,6 +39,21 @@ pub(super) struct PublicIpCache {
     ipv6: Option<CacheEntry>,
 }
 
+#[derive(Debug, Default)]
+pub(super) struct CacheLoadResult {
+    pub(super) cache: Option<PublicIpCache>,
+    pub(super) warnings: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPublicIpCache {
+    version: u8,
+    #[serde(default)]
+    ipv4: Option<Value>,
+    #[serde(default)]
+    ipv6: Option<Value>,
+}
+
 impl Default for PublicIpCache {
     fn default() -> Self {
         Self {
@@ -47,30 +64,116 @@ impl Default for PublicIpCache {
     }
 }
 
-pub(super) fn load(cache_path: &Path) -> Option<PublicIpCache> {
-    validate_cache_parent(cache_path).ok()?;
-    let cache_file = OpenOptions::new()
+pub(super) fn load(cache_path: &Path, now: u64) -> CacheLoadResult {
+    if let Err(error) = validate_cache_parent(cache_path) {
+        return if error.kind() == io::ErrorKind::NotFound {
+            CacheLoadResult::default()
+        } else {
+            ignored_cache(error.to_string())
+        };
+    }
+    let cache_file = match OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK | O_NOFOLLOW)
         .open(cache_path)
-        .ok()?;
-    let metadata = cache_file.metadata().ok()?;
-    if !metadata.file_type().is_file()
-        || validate_owner(&metadata, effective_uid()).is_err()
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > MAX_CACHE_BYTES as u64
     {
-        return None;
+        Ok(cache_file) => cache_file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return CacheLoadResult::default();
+        }
+        Err(error) => {
+            let warning = match fs::symlink_metadata(cache_path) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    "cache target is not a regular file".to_string()
+                }
+                _ => format!("cache file could not be opened: {error}"),
+            };
+            return ignored_cache(warning);
+        }
+    };
+    let metadata = match cache_file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return ignored_cache(format!("cache metadata could not be read: {error}")),
+    };
+    if !metadata.file_type().is_file() {
+        return ignored_cache("cache target is not a regular file");
+    }
+    if let Err(error) = validate_owner(&metadata, effective_uid()) {
+        return ignored_cache(error.to_string());
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return ignored_cache("cache file permissions are not trusted");
+    }
+    if metadata.len() > MAX_CACHE_BYTES as u64 {
+        return ignored_cache(format!("cache exceeds {MAX_CACHE_BYTES}-byte limit"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    cache_file
+    if let Err(error) = cache_file
         .take(MAX_CACHE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
+    {
+        return ignored_cache(format!("cache content could not be read: {error}"));
+    }
     if bytes.len() > MAX_CACHE_BYTES {
+        return ignored_cache(format!("cache exceeds {MAX_CACHE_BYTES}-byte limit"));
+    }
+    let raw: RawPublicIpCache = match serde_json::from_slice(&bytes) {
+        Ok(raw) => raw,
+        Err(_) => return ignored_cache("malformed cache JSON"),
+    };
+    if raw.version != CACHE_VERSION {
+        return ignored_cache(format!("unsupported cache schema version {}", raw.version));
+    }
+
+    let mut warnings = Vec::new();
+    let ipv4 = parse_cache_entry(raw.ipv4, AddressFamily::Ipv4, now, &mut warnings);
+    let ipv6 = parse_cache_entry(raw.ipv6, AddressFamily::Ipv6, now, &mut warnings);
+    CacheLoadResult {
+        cache: Some(PublicIpCache {
+            version: raw.version,
+            ipv4,
+            ipv6,
+        }),
+        warnings,
+    }
+}
+
+fn ignored_cache(warning: impl Into<String>) -> CacheLoadResult {
+    CacheLoadResult {
+        cache: None,
+        warnings: vec![warning.into()],
+    }
+}
+
+fn parse_cache_entry(
+    value: Option<Value>,
+    family: AddressFamily,
+    now: u64,
+    warnings: &mut Vec<String>,
+) -> Option<CacheEntry> {
+    let value = value?;
+    let mut entry: CacheEntry = match serde_json::from_value(value) {
+        Ok(entry) => entry,
+        Err(_) => {
+            warnings.push(format!("{} cache entry is malformed", family.label()));
+            return None;
+        }
+    };
+    let Some(address) = canonical_public_ip(&entry.address, family) else {
+        let problem = if entry.address.trim().parse::<IpAddr>().is_ok() {
+            "has wrong address family"
+        } else {
+            "is malformed"
+        };
+        warnings.push(format!("{} cache entry {problem}", family.label()));
+        return None;
+    };
+    if entry.observed_at > now {
+        warnings.push(format!("{} cache entry is future-dated", family.label()));
         return None;
     }
-    serde_json::from_slice(&bytes).ok()
+    entry.address = address;
+    Some(entry)
 }
 
 pub(super) fn fresh_address(
@@ -123,7 +226,7 @@ pub(super) fn merge_successful_entries_with_timeout(
     let lock_path = parent.join(CACHE_LOCK_FILE_NAME);
     let lock_file = acquire_cache_lock(&lock_path, cache_lock_timeout)?;
 
-    let mut cache = cache_for_update(load(cache_path));
+    let mut cache = cache_for_update(load(cache_path, now).cache);
     if let Some(address) = live_ipv4 {
         cache.ipv4 = Some(CacheEntry {
             address,
@@ -438,7 +541,11 @@ mod tests {
         let urls = server_urls(&[&server]);
         let urls = url_refs(&urls);
 
-        let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
+        let PublicIpResolution {
+            ipv4,
+            cache_warning,
+            ..
+        } = resolve_public_ips_with_policy(
             &Client::new(),
             &urls,
             &[],
@@ -449,6 +556,12 @@ mod tests {
         .await;
 
         assert_eq!(ipv4, successful("1.1.1.1"));
+        assert_eq!(
+            cache_warning.as_deref(),
+            Some(
+                "cache read ignored: cache directory permissions are not trusted | cache write skipped: cache directory permissions are not trusted"
+            )
+        );
         assert_eq!(server.request_count(), 1);
         assert_eq!(fs::read_to_string(&cache_path).unwrap(), original);
         assert_eq!(
@@ -480,7 +593,11 @@ mod tests {
 
         assert!(!cache_directory.exists());
 
-        let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
+        let PublicIpResolution {
+            ipv4,
+            cache_warning,
+            ..
+        } = resolve_public_ips_with_policy(
             &Client::new(),
             &ipv4_urls,
             &[],
@@ -491,6 +608,7 @@ mod tests {
         .await;
 
         assert_eq!(ipv4, successful("8.8.4.80"));
+        assert_eq!(cache_warning, None);
         assert!(cache_directory.is_dir());
         let cache: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
@@ -755,7 +873,11 @@ mod tests {
     async fn invalid_cache_variants_are_live_lookup_misses() {
         let now = 1_780_001_000;
         let cases = [
-            ("malformed JSON", "{not json".to_string()),
+            (
+                "malformed JSON",
+                "{not json".to_string(),
+                Some("cache read ignored: malformed cache JSON"),
+            ),
             (
                 "unsupported schema",
                 json!({
@@ -763,6 +885,7 @@ mod tests {
                     "ipv4": {"address": "8.8.4.10", "observed_at": now}
                 })
                 .to_string(),
+                Some("cache read ignored: unsupported cache schema version 2"),
             ),
             (
                 "wrong address family",
@@ -771,6 +894,16 @@ mod tests {
                     "ipv4": {"address": "2606:4700:4700::10", "observed_at": now}
                 })
                 .to_string(),
+                Some("cache read ignored: IPv4 cache entry has wrong address family"),
+            ),
+            (
+                "malformed address",
+                json!({
+                    "version": 1,
+                    "ipv4": {"address": "not-an-address", "observed_at": now}
+                })
+                .to_string(),
+                Some("cache read ignored: IPv4 cache entry is malformed"),
             ),
             (
                 "expired timestamp",
@@ -779,6 +912,7 @@ mod tests {
                     "ipv4": {"address": "8.8.4.10", "observed_at": now - 900}
                 })
                 .to_string(),
+                None,
             ),
             (
                 "future timestamp",
@@ -787,10 +921,11 @@ mod tests {
                     "ipv4": {"address": "8.8.4.10", "observed_at": now + 1}
                 })
                 .to_string(),
+                Some("cache read ignored: IPv4 cache entry is future-dated"),
             ),
         ];
 
-        for (case, cache) in cases {
+        for (case, cache, expected_warning) in cases {
             let directory = TestDirectory::new();
             let cache_path = directory.cache_path();
             write_private_cache(&cache_path, cache);
@@ -799,7 +934,11 @@ mod tests {
             let ipv4_urls = server_urls(&[&server]);
             let ipv4_urls = url_refs(&ipv4_urls);
 
-            let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
+            let PublicIpResolution {
+                ipv4,
+                cache_warning,
+                ..
+            } = resolve_public_ips_with_policy(
                 &Client::new(),
                 &ipv4_urls,
                 &[],
@@ -811,6 +950,7 @@ mod tests {
 
             assert_eq!(ipv4, successful("8.8.4.99"), "{case} should miss");
             assert_eq!(server.request_count(), 1, "{case} should use HTTP");
+            assert_eq!(cache_warning.as_deref(), expected_warning, "{case}");
         }
     }
 
@@ -859,10 +999,7 @@ mod tests {
         let oversized_urls = server_urls(&[&live_server]);
         let oversized_urls = url_refs(&oversized_urls);
 
-        let PublicIpResolution {
-            ipv4: oversized_ipv4,
-            ..
-        } = resolve_public_ips_with_policy(
+        let oversized_resolution = resolve_public_ips_with_policy(
             &Client::new(),
             &oversized_urls,
             &[],
@@ -872,8 +1009,13 @@ mod tests {
         )
         .await;
 
+        let oversized_ipv4 = oversized_resolution.ipv4.clone();
         assert_eq!(oversized_ipv4, successful("8.8.4.71"));
         assert_eq!(live_server.request_count(), 1);
+        assert_eq!(
+            oversized_resolution.cache_warning.as_deref(),
+            Some("cache read ignored: cache exceeds 4096-byte limit")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -975,7 +1117,7 @@ mod tests {
         let ipv4_start = Arc::clone(&start);
         let ipv4_started = started_sender.clone();
         let ipv4_writer = thread::spawn(move || {
-            let snapshot = load(&ipv4_cache_path).unwrap();
+            let snapshot = load(&ipv4_cache_path, now).cache.unwrap();
             assert_eq!(snapshot.ipv4.unwrap().address, "8.8.4.10");
             ipv4_start.wait();
             ipv4_started.send(()).unwrap();
@@ -992,7 +1134,7 @@ mod tests {
         let ipv6_start = Arc::clone(&start);
         let ipv6_started = started_sender.clone();
         let ipv6_writer = thread::spawn(move || {
-            let snapshot = load(&ipv6_cache_path).unwrap();
+            let snapshot = load(&ipv6_cache_path, now).cache.unwrap();
             assert_eq!(snapshot.ipv6.unwrap().address, "2606:4700:4700::10");
             ipv6_start.wait();
             ipv6_started.send(()).unwrap();
@@ -1086,6 +1228,10 @@ mod tests {
 
         let (resolution, elapsed) = received.expect("lock acquisition must time out");
         assert_eq!(resolution.ipv4, successful("8.8.4.21"));
+        assert_eq!(
+            resolution.cache_warning.as_deref(),
+            Some("cache write skipped: timed out acquiring cache lock")
+        );
         assert!(elapsed >= Duration::from_millis(25), "elapsed: {elapsed:?}");
         assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
         assert_eq!(fs::read_to_string(&cache_path).unwrap(), original_cache);
@@ -1246,7 +1392,11 @@ mod tests {
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
-        let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
+        let PublicIpResolution {
+            ipv4,
+            cache_warning,
+            ..
+        } = resolve_public_ips_with_policy(
             &Client::new(),
             &ipv4_urls,
             &[],
@@ -1257,7 +1407,81 @@ mod tests {
         .await;
 
         assert_eq!(ipv4, successful("8.8.4.50"));
+        assert_eq!(
+            cache_warning.as_deref(),
+            Some(
+                "cache read ignored: cache target is not a regular file | cache write skipped: cache target is not a regular file"
+            )
+        );
         assert!(non_regular_cache_path.is_dir());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_family_entry_warns_without_discarding_valid_other_family() {
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let now = 1_780_001_000;
+        write_private_cache(
+            &cache_path,
+            json!({
+                "version": 1,
+                "ipv4": {"address": "2606:4700:4700::20", "observed_at": now},
+                "ipv6": {"address": "2606:4700:4700::21", "observed_at": now}
+            })
+            .to_string(),
+        );
+        let ipv4_server =
+            TestHttpServer::start(|_| ("200 OK", "8.8.4.20", Duration::from_millis(5)));
+        let unexpected_ipv6 =
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+        let ipv4_urls = server_urls(&[&ipv4_server]);
+        let ipv6_urls = server_urls(&[&unexpected_ipv6]);
+        let ipv4_urls = url_refs(&ipv4_urls);
+        let ipv6_urls = url_refs(&ipv6_urls);
+
+        let first = resolve_public_ips_with_policy(
+            &Client::new(),
+            &ipv4_urls,
+            &ipv6_urls,
+            true,
+            "IPv6 unavailable".to_string(),
+            test_lookup_policy(&cache_path, now),
+        )
+        .await;
+
+        assert_eq!(first.ipv4, successful("8.8.4.20"));
+        assert_eq!(first.ipv6, successful("2606:4700:4700::21"));
+        assert_eq!(ipv4_server.request_count(), 1);
+        assert_eq!(unexpected_ipv6.request_count(), 0);
+        assert_eq!(
+            first.cache_warning.as_deref(),
+            Some("cache read ignored: IPv4 cache entry has wrong address family")
+        );
+
+        let unexpected_ipv4 =
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+        let unexpected_ipv6 =
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+        let ipv4_urls = server_urls(&[&unexpected_ipv4]);
+        let ipv6_urls = server_urls(&[&unexpected_ipv6]);
+        let ipv4_urls = url_refs(&ipv4_urls);
+        let ipv6_urls = url_refs(&ipv6_urls);
+
+        let second = resolve_public_ips_with_policy(
+            &Client::new(),
+            &ipv4_urls,
+            &ipv6_urls,
+            true,
+            "IPv6 unavailable".to_string(),
+            test_lookup_policy(&cache_path, now + 1),
+        )
+        .await;
+
+        assert_eq!(second.ipv4, successful("8.8.4.20"));
+        assert_eq!(second.ipv6, successful("2606:4700:4700::21"));
+        assert_eq!(unexpected_ipv4.request_count(), 0);
+        assert_eq!(unexpected_ipv6.request_count(), 0);
+        assert_eq!(second.cache_warning, None);
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub struct Output<'a> {
 
 #[derive(Serialize)]
 pub struct IpOutput {
+    pub cache_warning: Option<String>,
     pub public_ip: String,
     pub public_ipv6: String,
     pub error_ipv4: Option<String>,
@@ -195,6 +196,7 @@ mod tests {
         let output = Output {
             saltbox_facts_version: "1.2.3",
             ip: IpOutput {
+                cache_warning: None,
                 public_ip: String::new(),
                 public_ipv6: String::new(),
                 error_ipv4: Some("IPv4 error".to_string()),
@@ -214,6 +216,7 @@ mod tests {
         assert_eq!(
             value["ip"].as_object().unwrap().keys().collect::<Vec<_>>(),
             [
+                "cache_warning",
                 "error_ipv4",
                 "error_ipv6",
                 "failed_ipv4",
@@ -223,6 +226,11 @@ mod tests {
                 "public_ipv6",
             ]
         );
+        assert!(value["ip"]
+            .as_object()
+            .unwrap()
+            .contains_key("cache_warning"));
+        assert!(value["ip"]["cache_warning"].is_null());
         assert!(value["groups"].is_object());
         assert!(value["users"].is_object());
         assert!(value["timezone"]["timezone"].is_string());
