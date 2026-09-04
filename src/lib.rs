@@ -1,8 +1,8 @@
 mod public_ip;
 
 pub use public_ip::{
-    get_ip, has_global_ipv6_from_if_inet6, has_valid_ipv6, ipv6_unavailable_error,
-    resolve_public_ips, validate_ip, PUBLIC_IP_CACHE_PATH, REQUEST_TIMEOUT,
+    has_global_ipv6_from_if_inet6, has_valid_ipv6, ipv6_unavailable_error, resolve_public_ips,
+    LookupOutcome, PublicIpResolution,
 };
 
 use serde::Serialize;

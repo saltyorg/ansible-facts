@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ip_future = async {
         let (ipv6_present, ipv6_check_error) = has_valid_ipv6(IF_INET6_FILE_PATH);
         let unavailable_error = ipv6_unavailable_error(ipv6_check_error.as_deref());
-        let ((ipv4, ipv4_error), (ipv6, ipv6_error)) = resolve_public_ips(
+        let resolution = resolve_public_ips(
             &client,
             &IPV4_URLS,
             &IPV6_URLS,
@@ -59,15 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             unavailable_error,
         )
         .await;
-        ((ipv4, ipv4_error), (ipv6, ipv6_error), ipv6_check_error)
+        (resolution, ipv6_check_error)
     };
 
-    let (
-        ((ipv4, ipv4_error), (ipv6, ipv6_error), ipv6_check_error),
-        groups_result,
-        users_result,
-        timezone_result,
-    ) = tokio::join!(ip_future, groups_handle, users_handle, timezone_handle);
+    let ((resolution, ipv6_check_error), groups_result, users_result, timezone_result) =
+        tokio::join!(ip_future, groups_handle, users_handle, timezone_handle);
 
     let groups_data =
         groups_result.map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })??;
@@ -78,16 +74,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Saltbox deliberately treats a missing public address as invalid, including
     // when no global IPv6 interface exists and the IPv6 request is skipped.
-    let failed_ipv4 = ipv4.is_none();
-    let failed_ipv6 = ipv6.is_none();
+    let failed_ipv4 = resolution.ipv4.address.is_none();
+    let failed_ipv6 = resolution.ipv6.address.is_none();
 
     let result = Output {
         saltbox_facts_version: VERSION,
         ip: IpOutput {
-            public_ip: ipv4.unwrap_or_default(),
-            public_ipv6: ipv6.unwrap_or_default(),
-            error_ipv4: ipv4_error,
-            error_ipv6: ipv6_error,
+            public_ip: resolution.ipv4.address.unwrap_or_default(),
+            public_ipv6: resolution.ipv6.address.unwrap_or_default(),
+            error_ipv4: resolution.ipv4.error,
+            error_ipv6: resolution.ipv6.error,
             failed_ipv4,
             failed_ipv6,
             ipv6_check_error,
