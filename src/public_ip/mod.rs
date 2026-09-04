@@ -23,10 +23,31 @@ pub struct PublicIpResolution {
 #[derive(Clone, Copy)]
 struct LookupPolicy<'a> {
     cache_path: &'a Path,
-    now: u64,
+    observed_at: u64,
+    reload_validation_clock: CacheValidationClock,
     retry_delays: [Duration; 2],
     request_timeout: Duration,
     cache_lock_timeout: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum CacheValidationClock {
+    System,
+    #[cfg(test)]
+    Fixed(u64),
+}
+
+impl CacheValidationClock {
+    fn sample(self) -> u64 {
+        match self {
+            Self::System => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            #[cfg(test)]
+            Self::Fixed(now) => now,
+        }
+    }
 }
 
 struct LookupExecution {
@@ -41,10 +62,8 @@ pub async fn resolve_public_ips(
     ipv6_available: bool,
     ipv6_unavailable_error: String,
 ) -> PublicIpResolution {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let validation_clock = CacheValidationClock::System;
+    let observed_at = validation_clock.sample();
     resolve_public_ips_with_policy(
         client,
         ipv4_urls,
@@ -53,7 +72,8 @@ pub async fn resolve_public_ips(
         ipv6_unavailable_error,
         LookupPolicy {
             cache_path: Path::new(cache::PUBLIC_IP_CACHE_PATH),
-            now,
+            observed_at,
+            reload_validation_clock: validation_clock,
             retry_delays: http::RETRY_DELAYS,
             request_timeout: http::REQUEST_TIMEOUT,
             cache_lock_timeout: cache::CACHE_LOCK_TIMEOUT,
@@ -72,17 +92,19 @@ async fn resolve_public_ips_with_policy(
 ) -> PublicIpResolution {
     let cache_path = policy.cache_path.to_path_buf();
     let (loaded_cache, mut cache_read_warnings) =
-        match tokio::task::spawn_blocking(move || cache::load(&cache_path, policy.now)).await {
+        match tokio::task::spawn_blocking(move || cache::load(&cache_path, policy.observed_at))
+            .await
+        {
             Ok(result) => (result.cache, result.warnings),
             Err(error) => (None, vec![format!("cache read task failed: {error}")]),
         };
     let cached_ipv4 = loaded_cache
         .as_ref()
-        .and_then(|cache| cache::fresh_address(cache, AddressFamily::Ipv4, policy.now));
+        .and_then(|cache| cache::fresh_address(cache, AddressFamily::Ipv4, policy.observed_at));
     let cached_ipv6 = if ipv6_available {
         loaded_cache
             .as_ref()
-            .and_then(|cache| cache::fresh_address(cache, AddressFamily::Ipv6, policy.now))
+            .and_then(|cache| cache::fresh_address(cache, AddressFamily::Ipv6, policy.observed_at))
     } else {
         None
     };
@@ -107,12 +129,14 @@ async fn resolve_public_ips_with_policy(
         let cache_path = policy.cache_path.to_path_buf();
         let live_ipv4 = ipv4.live_address;
         let live_ipv6 = ipv6.live_address;
+        let reload_validation_clock = policy.reload_validation_clock;
         match tokio::task::spawn_blocking(move || {
             cache::merge_successful_entries_with_timeout(
                 &cache_path,
                 live_ipv4,
                 live_ipv6,
-                policy.now,
+                policy.observed_at,
+                || reload_validation_clock.sample(),
                 policy.cache_lock_timeout,
             )
         })
@@ -410,9 +434,18 @@ pub(super) mod test_support {
     }
 
     pub(super) fn test_lookup_policy(cache_path: &Path, now: u64) -> LookupPolicy<'_> {
+        test_lookup_policy_with_reload_time(cache_path, now, now)
+    }
+
+    pub(super) fn test_lookup_policy_with_reload_time(
+        cache_path: &Path,
+        observed_at: u64,
+        reload_validation_time: u64,
+    ) -> LookupPolicy<'_> {
         LookupPolicy {
             cache_path,
-            now,
+            observed_at,
+            reload_validation_clock: super::CacheValidationClock::Fixed(reload_validation_time),
             retry_delays: [Duration::ZERO, Duration::ZERO],
             request_timeout: Duration::from_millis(25),
             cache_lock_timeout: Duration::from_millis(25),

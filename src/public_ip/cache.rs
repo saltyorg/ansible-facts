@@ -218,13 +218,17 @@ fn canonical_cache_entry(mut entry: CacheEntry, family: AddressFamily) -> Option
     Some(entry)
 }
 
-pub(super) fn merge_successful_entries_with_timeout(
+pub(super) fn merge_successful_entries_with_timeout<F>(
     cache_path: &Path,
     live_ipv4: Option<String>,
     live_ipv6: Option<String>,
-    now: u64,
+    observed_at: u64,
+    reload_validation_time: F,
     cache_lock_timeout: Duration,
-) -> CacheMergeResult {
+) -> CacheMergeResult
+where
+    F: FnOnce() -> u64,
+{
     let mut read_warnings = Vec::new();
     let write_result = (|| {
         let parent = cache_path
@@ -234,19 +238,19 @@ pub(super) fn merge_successful_entries_with_timeout(
         let lock_path = parent.join(CACHE_LOCK_FILE_NAME);
         let lock_file = acquire_cache_lock(&lock_path, cache_lock_timeout)?;
 
-        let loaded = load(cache_path, now);
+        let loaded = load(cache_path, reload_validation_time());
         read_warnings = loaded.warnings;
         let mut cache = cache_for_update(loaded.cache);
         if let Some(address) = live_ipv4 {
             cache.ipv4 = Some(CacheEntry {
                 address,
-                observed_at: now,
+                observed_at,
             });
         }
         if let Some(address) = live_ipv6 {
             cache.ipv6 = Some(CacheEntry {
                 address,
-                observed_at: now,
+                observed_at,
             });
         }
         write_cache_atomically(cache_path, &cache)?;
@@ -1106,6 +1110,90 @@ mod tests {
     }
 
     #[test]
+    fn stale_writer_preserves_newer_complementary_entry_at_locked_reload_time() {
+        // Catches validating an under-lock reload with the live observation timestamp.
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let observed_at = 1_780_001_000;
+        let reload_validation_time = observed_at + 2;
+        write_private_cache(
+            &cache_path,
+            json!({
+                "version": 1,
+                "ipv6": {
+                    "address": "2606:4700:4700::11",
+                    "observed_at": observed_at + 1
+                }
+            })
+            .to_string(),
+        );
+
+        let result = merge_successful_entries_with_timeout(
+            &cache_path,
+            Some("8.8.4.11".to_string()),
+            None,
+            observed_at,
+            || reload_validation_time,
+            CACHE_LOCK_TIMEOUT,
+        );
+
+        assert!(result.read_warnings.is_empty());
+        result.write_result.unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            merged["ipv4"],
+            json!({"address": "8.8.4.11", "observed_at": observed_at})
+        );
+        assert_eq!(
+            merged["ipv6"],
+            json!({
+                "address": "2606:4700:4700::11",
+                "observed_at": observed_at + 1
+            })
+        );
+    }
+
+    #[test]
+    fn locked_reload_rejects_entry_beyond_its_validation_time() {
+        // Catches weakening future-date rejection while separating reload validation time.
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let observed_at = 1_780_001_000;
+        let reload_validation_time = observed_at + 2;
+        write_private_cache(
+            &cache_path,
+            json!({
+                "version": 1,
+                "ipv6": {
+                    "address": "2606:4700:4700::12",
+                    "observed_at": reload_validation_time + 1
+                }
+            })
+            .to_string(),
+        );
+
+        let result = merge_successful_entries_with_timeout(
+            &cache_path,
+            Some("8.8.4.12".to_string()),
+            None,
+            observed_at,
+            || reload_validation_time,
+            CACHE_LOCK_TIMEOUT,
+        );
+
+        assert_eq!(result.read_warnings, ["IPv6 cache entry is future-dated"]);
+        result.write_result.unwrap();
+        let merged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            merged["ipv4"],
+            json!({"address": "8.8.4.12", "observed_at": observed_at})
+        );
+        assert!(merged.get("ipv6").is_none());
+    }
+
+    #[test]
     fn concurrent_complementary_writers_merge_the_latest_cache() {
         let directory = TestDirectory::new();
         let cache_path = directory.cache_path();
@@ -1141,6 +1229,7 @@ mod tests {
                 Some("8.8.4.11".to_string()),
                 None,
                 now,
+                || now,
                 CACHE_LOCK_TIMEOUT,
             )
         });
@@ -1158,6 +1247,7 @@ mod tests {
                 None,
                 Some("2606:4700:4700::11".to_string()),
                 now,
+                || now,
                 CACHE_LOCK_TIMEOUT,
             )
         });
@@ -1497,6 +1587,58 @@ mod tests {
         assert_eq!(unexpected_ipv4.request_count(), 0);
         assert_eq!(unexpected_ipv6.request_count(), 0);
         assert_eq!(second.cache_warning, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolver_uses_locked_reload_time_for_a_stale_writer_merge() {
+        // Catches wiring the live observation timestamp into reload validation.
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let observed_at = 1_780_001_000;
+        let reload_validation_time = observed_at + 2;
+        let writer_b_cache_path = cache_path.clone();
+        let server = TestHttpServer::start_with_handler(move |stream, _| {
+            write_private_cache(
+                &writer_b_cache_path,
+                json!({
+                    "version": 1,
+                    "ipv6": {
+                        "address": "2606:4700:4700::13",
+                        "observed_at": observed_at + 1
+                    }
+                })
+                .to_string(),
+            );
+            handle_test_request(stream, ("200 OK", "8.8.4.13", Duration::ZERO));
+        });
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+
+        let resolution = resolve_public_ips_with_policy(
+            &Client::new(),
+            &urls,
+            &[],
+            false,
+            "IPv6 unavailable".to_string(),
+            test_lookup_policy_with_reload_time(&cache_path, observed_at, reload_validation_time),
+        )
+        .await;
+
+        assert_eq!(resolution.ipv4, successful("8.8.4.13"));
+        assert_eq!(resolution.cache_warning, None);
+        let merged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            merged["ipv4"],
+            json!({"address": "8.8.4.13", "observed_at": observed_at})
+        );
+        assert_eq!(
+            merged["ipv6"],
+            json!({
+                "address": "2606:4700:4700::13",
+                "observed_at": observed_at + 1
+            })
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
