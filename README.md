@@ -2,7 +2,7 @@
 
 `saltbox-facts` is the executable Ansible local fact used by Saltbox. It emits
 one compact JSON object containing the host's public addresses, local users and
-groups, timezone, and the binary version.
+groups, and timezone.
 
 The binary targets Linux and requires Rust 1.89 or newer when built from
 source. Tagged releases publish static MUSL binaries for amd64, arm64, ARMv7,
@@ -24,11 +24,9 @@ Running the binary without arguments prints one JSON object to standard output:
     "error_ipv6": null,
     "failed_ipv4": false,
     "failed_ipv6": false,
-    "ipv6_check_error": null,
     "public_ip": "1.1.1.1",
     "public_ipv6": "2606:4700:4700::1111"
   },
-  "saltbox_facts_version": "1.2.3",
   "timezone": {
     "timezone": "Europe/Copenhagen"
   },

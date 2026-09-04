@@ -13,8 +13,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 #[derive(Serialize)]
-pub struct Output<'a> {
-    pub saltbox_facts_version: &'a str,
+pub struct Output {
     pub ip: IpOutput,
     pub groups: HashMap<String, GroupData>,
     pub users: HashMap<String, UserData>,
@@ -30,7 +29,6 @@ pub struct IpOutput {
     pub error_ipv6: Option<String>,
     pub failed_ipv4: bool,
     pub failed_ipv6: bool,
-    pub ipv6_check_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,7 +192,6 @@ mod tests {
     #[test]
     fn output_schema_matches_saltbox_contract() {
         let output = Output {
-            saltbox_facts_version: "1.2.3",
             ip: IpOutput {
                 cache_warning: None,
                 public_ip: String::new(),
@@ -203,7 +200,6 @@ mod tests {
                 error_ipv6: Some("IPv6 error".to_string()),
                 failed_ipv4: true,
                 failed_ipv6: true,
-                ipv6_check_error: None,
             },
             groups: HashMap::new(),
             users: HashMap::new(),
@@ -221,7 +217,6 @@ mod tests {
                 "error_ipv6",
                 "failed_ipv4",
                 "failed_ipv6",
-                "ipv6_check_error",
                 "public_ip",
                 "public_ipv6",
             ]
@@ -234,7 +229,10 @@ mod tests {
         assert!(value["groups"].is_object());
         assert!(value["users"].is_object());
         assert!(value["timezone"]["timezone"].is_string());
-        assert!(value["saltbox_facts_version"].is_string());
+        assert!(!value
+            .as_object()
+            .unwrap()
+            .contains_key("saltbox_facts_version"));
     }
 
     #[test]

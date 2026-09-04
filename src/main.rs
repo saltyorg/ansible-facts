@@ -49,20 +49,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::task::spawn_blocking(|| get_timezone(ETC_TIMEZONE_PATH, LOCALTIME_PATH));
 
     let ip_future = async {
-        let (ipv6_present, ipv6_check_error) = has_valid_ipv6(IF_INET6_FILE_PATH);
-        let unavailable_error = ipv6_unavailable_error(ipv6_check_error.as_deref());
-        let resolution = resolve_public_ips(
+        let (ipv6_present, ipv6_probe_error) = has_valid_ipv6(IF_INET6_FILE_PATH);
+        let unavailable_error = ipv6_unavailable_error(ipv6_probe_error.as_deref());
+        resolve_public_ips(
             &client,
             &IPV4_URLS,
             &IPV6_URLS,
             ipv6_present,
             unavailable_error,
         )
-        .await;
-        (resolution, ipv6_check_error)
+        .await
     };
 
-    let ((resolution, ipv6_check_error), groups_result, users_result, timezone_result) =
+    let (resolution, groups_result, users_result, timezone_result) =
         tokio::join!(ip_future, groups_handle, users_handle, timezone_handle);
 
     let groups_data =
@@ -78,7 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let failed_ipv6 = resolution.ipv6.address.is_none();
 
     let result = Output {
-        saltbox_facts_version: VERSION,
         ip: IpOutput {
             cache_warning: resolution.cache_warning,
             public_ip: resolution.ipv4.address.unwrap_or_default(),
@@ -87,7 +85,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error_ipv6: resolution.ipv6.error,
             failed_ipv4,
             failed_ipv6,
-            ipv6_check_error,
         },
         groups: groups_data,
         users: users_data,

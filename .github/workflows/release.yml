@@ -113,6 +113,17 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           fact_binary="${GITHUB_WORKSPACE}/target/${TARGET}/release/saltbox-facts"
+          version_output="$(
+            docker run --rm \
+              --entrypoint sh \
+              --volume "${fact_binary}:/tmp/saltbox-facts:ro" \
+              "ghcr.io/cross-rs/${TARGET}:0.2.5" \
+              -lc 'qemu-arm -cpu arm926 /tmp/saltbox-facts --version'
+          )"
+          if [ "$version_output" != "$VERSION" ]; then
+            echo "ARMv5 runtime check emitted version '${version_output}', expected '${VERSION}'." >&2
+            exit 1
+          fi
           output="$(
             docker run --rm \
               --entrypoint sh \
@@ -120,13 +131,6 @@ jobs:
               "ghcr.io/cross-rs/${TARGET}:0.2.5" \
               -lc 'qemu-arm -cpu arm926 /tmp/saltbox-facts'
           )"
-          case "$output" in
-            *'"saltbox_facts_version":'*) ;;
-            *)
-              echo "ARMv5 runtime check did not emit the version fact." >&2
-              exit 1
-              ;;
-          esac
           case "$output" in
             *'"ip":'*) ;;
             *)
