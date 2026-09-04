@@ -45,6 +45,12 @@ pub(super) struct CacheLoadResult {
     pub(super) warnings: Vec<String>,
 }
 
+#[derive(Debug)]
+pub(super) struct CacheMergeResult {
+    pub(super) read_warnings: Vec<String>,
+    pub(super) write_result: io::Result<()>,
+}
+
 #[derive(Deserialize)]
 struct RawPublicIpCache {
     version: u8,
@@ -218,30 +224,39 @@ pub(super) fn merge_successful_entries_with_timeout(
     live_ipv6: Option<String>,
     now: u64,
     cache_lock_timeout: Duration,
-) -> io::Result<()> {
-    let parent = cache_path
-        .parent()
-        .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
-    ensure_cache_parent(cache_path)?;
-    let lock_path = parent.join(CACHE_LOCK_FILE_NAME);
-    let lock_file = acquire_cache_lock(&lock_path, cache_lock_timeout)?;
+) -> CacheMergeResult {
+    let mut read_warnings = Vec::new();
+    let write_result = (|| {
+        let parent = cache_path
+            .parent()
+            .ok_or_else(|| io::Error::other("cache path has no parent directory"))?;
+        ensure_cache_parent(cache_path)?;
+        let lock_path = parent.join(CACHE_LOCK_FILE_NAME);
+        let lock_file = acquire_cache_lock(&lock_path, cache_lock_timeout)?;
 
-    let mut cache = cache_for_update(load(cache_path, now).cache);
-    if let Some(address) = live_ipv4 {
-        cache.ipv4 = Some(CacheEntry {
-            address,
-            observed_at: now,
-        });
+        let loaded = load(cache_path, now);
+        read_warnings = loaded.warnings;
+        let mut cache = cache_for_update(loaded.cache);
+        if let Some(address) = live_ipv4 {
+            cache.ipv4 = Some(CacheEntry {
+                address,
+                observed_at: now,
+            });
+        }
+        if let Some(address) = live_ipv6 {
+            cache.ipv6 = Some(CacheEntry {
+                address,
+                observed_at: now,
+            });
+        }
+        write_cache_atomically(cache_path, &cache)?;
+        drop(lock_file);
+        Ok(())
+    })();
+    CacheMergeResult {
+        read_warnings,
+        write_result,
     }
-    if let Some(address) = live_ipv6 {
-        cache.ipv6 = Some(CacheEntry {
-            address,
-            observed_at: now,
-        });
-    }
-    write_cache_atomically(cache_path, &cache)?;
-    drop(lock_file);
-    Ok(())
 }
 
 fn ensure_cache_parent(cache_path: &Path) -> io::Result<()> {
@@ -1156,8 +1171,8 @@ mod tests {
         lock_file.unlock().unwrap();
         drop(lock_file);
 
-        ipv4_writer.join().unwrap().unwrap();
-        ipv6_writer.join().unwrap().unwrap();
+        ipv4_writer.join().unwrap().write_result.unwrap();
+        ipv6_writer.join().unwrap().write_result.unwrap();
 
         let merged: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
@@ -1482,6 +1497,43 @@ mod tests {
         assert_eq!(unexpected_ipv4.request_count(), 0);
         assert_eq!(unexpected_ipv6.request_count(), 0);
         assert_eq!(second.cache_warning, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn locked_reload_warning_survives_successful_cache_repair() {
+        // Catches dropping warnings from the writer's under-lock cache reload.
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let handler_cache_path = cache_path.clone();
+        let server = TestHttpServer::start_with_handler(move |stream, _| {
+            write_private_cache(&handler_cache_path, "{not json");
+            handle_test_request(stream, ("200 OK", "8.8.4.22", Duration::ZERO));
+        });
+        let urls = server_urls(&[&server]);
+        let urls = url_refs(&urls);
+        let now = 1_780_001_000;
+
+        let resolution = resolve_public_ips_with_policy(
+            &Client::new(),
+            &urls,
+            &[],
+            false,
+            "IPv6 unavailable".to_string(),
+            test_lookup_policy(&cache_path, now),
+        )
+        .await;
+
+        assert_eq!(resolution.ipv4, successful("8.8.4.22"));
+        assert_eq!(
+            resolution.cache_warning.as_deref(),
+            Some("cache read ignored: malformed cache JSON")
+        );
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_eq!(
+            repaired["ipv4"],
+            json!({"address": "8.8.4.22", "observed_at": now})
+        );
     }
 
     #[test]

@@ -71,7 +71,7 @@ async fn resolve_public_ips_with_policy(
     policy: LookupPolicy<'_>,
 ) -> PublicIpResolution {
     let cache_path = policy.cache_path.to_path_buf();
-    let (loaded_cache, cache_read_warnings) =
+    let (loaded_cache, mut cache_read_warnings) =
         match tokio::task::spawn_blocking(move || cache::load(&cache_path, policy.now)).await {
             Ok(result) => (result.cache, result.warnings),
             Err(error) => (None, vec![format!("cache read task failed: {error}")]),
@@ -118,8 +118,14 @@ async fn resolve_public_ips_with_policy(
         })
         .await
         {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.to_string()),
+            Ok(result) => {
+                for warning in result.read_warnings {
+                    if !cache_read_warnings.contains(&warning) {
+                        cache_read_warnings.push(warning);
+                    }
+                }
+                result.write_result.err().map(|error| error.to_string())
+            }
             Err(error) => Some(format!("cache write task failed: {error}")),
         }
     } else {
