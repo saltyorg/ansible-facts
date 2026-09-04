@@ -51,6 +51,13 @@
             ]
         },
         {
+            "description": "Cargo dependency ranges",
+            "matchManagers": [
+                "cargo"
+            ],
+            "rangeStrategy": "replace"
+        },
+        {
             "description": "Rust crate updates",
             "matchManagers": [
                 "cargo"
