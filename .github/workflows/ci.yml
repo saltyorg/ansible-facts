@@ -24,9 +24,8 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           components: clippy, rustfmt
 
       - name: Check formatting
@@ -45,7 +44,7 @@ jobs:
         run: cargo build --release --locked
 
   msrv:
-    name: Rust 1.89.0
+    name: Minimum supported Rust
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -54,10 +53,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.89.0
-        uses: dtolnay/rust-toolchain@v1
+      - name: Read minimum Rust version
+        id: rust_version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import re
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          version = manifest["package"]["rust-version"]
+          if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,2}", version):
+              raise SystemExit("package.rust-version must be a numeric Rust version")
+          toolchain = ".".join((version.split(".") + ["0", "0"])[:3])
+          print(f"toolchain={toolchain}")
+          PY
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.89.0"
+          toolchain: ${{ steps.rust_version.outputs.toolchain }}
 
       - name: Run tests
         run: cargo test --all-targets --all-features --locked

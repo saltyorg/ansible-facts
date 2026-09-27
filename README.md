@@ -4,8 +4,10 @@
 one compact JSON object containing the host's public addresses, local users and
 groups, and timezone.
 
-The binary targets Linux and requires Rust 1.89 or newer when built from
-source. Tagged releases publish static MUSL binaries for amd64, arm64, ARMv7,
+The binary targets Linux. Source builds require current stable Rust, with the
+required version declared by `package.rust-version` in [Cargo.toml](Cargo.toml).
+Renovate maintains that requirement, and CI reads it directly from the manifest.
+Tagged releases publish static MUSL binaries for amd64, arm64, ARMv7,
 ARMv6 hard-float, and ARMv5TE soft-float. The unqualified `saltbox-facts`
 release asset is the legacy amd64 name used by the standard Saltbox installer.
 The release job executes the ARMv5TE binary under an emulated ARM926 CPU before

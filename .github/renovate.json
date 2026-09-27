@@ -11,6 +11,19 @@
     "ansible": {
         "enabled": false
     },
+    "customManagers": [
+        {
+            "customType": "regex",
+            "description": "Maintain the Rust requirement in Cargo.toml",
+            "managerFilePatterns": ["/^Cargo\\.toml$/"],
+            "matchStrings": [
+                "(?:^|\\n)rust-version[ \\t]*=[ \\t]*\"(?<currentValue>[0-9]+(?:\\.[0-9]+){1,2})\""
+            ],
+            "depNameTemplate": "rust",
+            "datasourceTemplate": "rust-version",
+            "versioningTemplate": "rust-release-channel"
+        }
+    ],
     "labels": [
         "dependencies"
     ],
