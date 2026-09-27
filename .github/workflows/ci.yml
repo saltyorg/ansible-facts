@@ -16,6 +16,9 @@ jobs:
   stable:
     name: Stable Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_BACKTRACE: "1"
 
     steps:
       - uses: actions/checkout@v7
@@ -43,6 +46,9 @@ jobs:
   msrv:
     name: Rust 1.89.0
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUST_BACKTRACE: "1"
 
     steps:
       - uses: actions/checkout@v7

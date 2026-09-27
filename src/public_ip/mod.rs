@@ -35,6 +35,11 @@ enum CacheValidationClock {
     System,
     #[cfg(test)]
     Fixed(u64),
+    #[cfg(test)]
+    CheckWorkerThread {
+        now: u64,
+        executor: std::thread::ThreadId,
+    },
 }
 
 impl CacheValidationClock {
@@ -46,6 +51,15 @@ impl CacheValidationClock {
                 .as_secs(),
             #[cfg(test)]
             Self::Fixed(now) => now,
+            #[cfg(test)]
+            Self::CheckWorkerThread { now, executor } => {
+                assert_ne!(
+                    std::thread::current().id(),
+                    executor,
+                    "cache persistence ran on the async executor thread"
+                );
+                now
+            }
         }
     }
 }
@@ -247,211 +261,7 @@ pub fn has_global_ipv6_from_if_inet6(content: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(super) mod test_support {
-    use super::LookupPolicy;
-    use std::fs;
-    use std::io::{self, BufRead, BufReader as StdBufReader, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::thread::{self, JoinHandle};
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    pub(super) struct TestDirectory {
-        directory: TempDir,
-    }
-
-    impl TestDirectory {
-        pub(super) fn new() -> Self {
-            let directory = tempfile::Builder::new()
-                .prefix("saltbox-facts-test-")
-                .tempdir()
-                .unwrap();
-            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            Self { directory }
-        }
-
-        pub(super) fn path(&self) -> &Path {
-            self.directory.path()
-        }
-
-        pub(super) fn cache_path(&self) -> PathBuf {
-            let namespace = self.path().join("saltbox");
-            let cache_directory = namespace.join("facts");
-            if !namespace.exists() {
-                fs::create_dir(&namespace).unwrap();
-            }
-            if !cache_directory.exists() {
-                fs::create_dir(&cache_directory).unwrap();
-            }
-            fs::set_permissions(&namespace, fs::Permissions::from_mode(0o755)).unwrap();
-            fs::set_permissions(&cache_directory, fs::Permissions::from_mode(0o700)).unwrap();
-            cache_directory.join("public-ip.json")
-        }
-    }
-
-    pub(super) fn write_private_cache(path: &Path, contents: impl AsRef<[u8]>) {
-        fs::write(path, contents).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-
-    pub(super) struct TestHttpServer {
-        pub(super) url: String,
-        requests: Arc<AtomicUsize>,
-        shutdown: Arc<AtomicBool>,
-        thread: Option<JoinHandle<()>>,
-    }
-
-    impl TestHttpServer {
-        pub(super) fn start<F>(response: F) -> Self
-        where
-            F: Fn(usize) -> (&'static str, &'static str, Duration) + Send + Sync + 'static,
-        {
-            Self::start_with_handler(move |stream, request_number| {
-                handle_test_request(stream, response(request_number));
-            })
-        }
-
-        pub(super) fn start_with_handler<F>(handler: F) -> Self
-        where
-            F: Fn(TcpStream, usize) + Send + Sync + 'static,
-        {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let address = listener.local_addr().unwrap();
-            let requests = Arc::new(AtomicUsize::new(0));
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let thread_requests = Arc::clone(&requests);
-            let thread_shutdown = Arc::clone(&shutdown);
-            let handler = Arc::new(handler);
-            let server_thread = thread::spawn(move || {
-                while !thread_shutdown.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let request_number = thread_requests.fetch_add(1, Ordering::SeqCst) + 1;
-                            handler(stream, request_number);
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("test server accept failed: {error}"),
-                    }
-                }
-            });
-
-            Self {
-                url: format!("http://{address}"),
-                requests,
-                shutdown,
-                thread: Some(server_thread),
-            }
-        }
-
-        pub(super) fn request_count(&self) -> usize {
-            self.requests.load(Ordering::SeqCst)
-        }
-    }
-
-    impl Drop for TestHttpServer {
-        fn drop(&mut self) {
-            self.shutdown.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                thread.join().unwrap();
-            }
-        }
-    }
-
-    pub(super) fn handle_test_request(
-        mut stream: TcpStream,
-        (status, body, delay): (&str, &str, Duration),
-    ) {
-        let mut reader = StdBufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                break;
-            }
-        }
-        thread::sleep(delay);
-        if let Err(error) = write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        ) {
-            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        }
-    }
-
-    pub(super) fn handle_raw_test_request(
-        mut stream: TcpStream,
-        status: &str,
-        headers: &[(&str, &str)],
-        body_chunks: &[&[u8]],
-        delay: Duration,
-    ) {
-        let mut reader = StdBufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                break;
-            }
-        }
-        thread::sleep(delay);
-        write!(stream, "HTTP/1.1 {status}\r\nConnection: close\r\n").unwrap();
-        for (name, value) in headers {
-            write!(stream, "{name}: {value}\r\n").unwrap();
-        }
-        write!(stream, "\r\n").unwrap();
-
-        let chunked = headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("Transfer-Encoding") && *value == "chunked"
-        });
-        for chunk in body_chunks {
-            if chunked {
-                write!(stream, "{:X}\r\n", chunk.len()).unwrap();
-            }
-            stream.write_all(chunk).unwrap();
-            if chunked {
-                stream.write_all(b"\r\n").unwrap();
-            }
-        }
-        if chunked {
-            stream.write_all(b"0\r\n\r\n").unwrap();
-        }
-    }
-
-    pub(super) fn server_urls(servers: &[&TestHttpServer]) -> Vec<String> {
-        servers.iter().map(|server| server.url.clone()).collect()
-    }
-
-    pub(super) fn url_refs(urls: &[String]) -> Vec<&str> {
-        urls.iter().map(String::as_str).collect()
-    }
-
-    pub(super) fn test_lookup_policy(cache_path: &Path, now: u64) -> LookupPolicy<'_> {
-        test_lookup_policy_with_reload_time(cache_path, now, now)
-    }
-
-    pub(super) fn test_lookup_policy_with_reload_time(
-        cache_path: &Path,
-        observed_at: u64,
-        reload_validation_time: u64,
-    ) -> LookupPolicy<'_> {
-        LookupPolicy {
-            cache_path,
-            observed_at,
-            reload_validation_clock: super::CacheValidationClock::Fixed(reload_validation_time),
-            retry_delays: [Duration::ZERO, Duration::ZERO],
-            request_timeout: Duration::from_millis(25),
-            cache_lock_timeout: Duration::from_millis(25),
-        }
-    }
-}
+pub(super) mod test_support;
 
 #[cfg(test)]
 mod tests {

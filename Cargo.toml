@@ -30,6 +30,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 [dev-dependencies]
 criterion = "0.8.2"
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [[bench]]
 name = "local_paths"

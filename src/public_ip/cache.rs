@@ -360,18 +360,33 @@ fn acquire_cache_lock(lock_path: &Path, lock_timeout: Duration) -> io::Result<Fi
     validate_owner(&metadata, effective_uid())?;
     lock_file.set_permissions(fs::Permissions::from_mode(CACHE_FILE_MODE))?;
     let started = Instant::now();
+    lock_with_retry(
+        &lock_file,
+        lock_timeout,
+        || started.elapsed(),
+        std::thread::sleep,
+    )?;
+    Ok(lock_file)
+}
+
+fn lock_with_retry(
+    lock_file: &File,
+    lock_timeout: Duration,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<()> {
     loop {
         match lock_file.try_lock() {
-            Ok(()) => return Ok(lock_file),
+            Ok(()) => return Ok(()),
             Err(TryLockError::WouldBlock) => {
-                let elapsed = started.elapsed();
+                let elapsed = elapsed();
                 if elapsed >= lock_timeout {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out acquiring cache lock",
                     ));
                 }
-                std::thread::sleep(CACHE_LOCK_RETRY_DELAY.min(lock_timeout - elapsed));
+                sleep(CACHE_LOCK_RETRY_DELAY.min(lock_timeout - elapsed));
             }
             Err(TryLockError::Error(error)) => return Err(error),
         }
@@ -431,15 +446,15 @@ mod tests {
     use super::*;
     use crate::public_ip::test_support::*;
     use crate::public_ip::{resolve_public_ips_with_policy, LookupOutcome, PublicIpResolution};
-    use reqwest::Client;
     use serde_json::json;
+    use std::cell::Cell;
     use std::fs;
     use std::io;
     use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::process::Command;
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn successful(address: &str) -> LookupOutcome {
         LookupOutcome {
@@ -461,17 +476,15 @@ mod tests {
             })
             .to_string(),
         );
-        let ipv4_server =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
-        let ipv6_server =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+        let ipv4_server = TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
+        let ipv6_server = TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
         let ipv4_urls = server_urls(&[&ipv4_server]);
         let ipv6_urls = server_urls(&[&ipv6_server]);
         let ipv4_urls = url_refs(&ipv4_urls);
         let ipv6_urls = url_refs(&ipv6_urls);
 
         let PublicIpResolution { ipv4, ipv6, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &ipv6_urls,
             true,
@@ -511,12 +524,12 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&cache_path, fs::Permissions::from_mode(file_mode)).unwrap();
-            let server = TestHttpServer::start(|_| ("200 OK", "1.1.1.1", Duration::from_millis(5)));
+            let server = TestHttpServer::start(|_| ("200 OK", "1.1.1.1"));
             let urls = server_urls(&[&server]);
             let urls = url_refs(&urls);
 
             let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-                &Client::new(),
+                &test_client(),
                 &urls,
                 &[],
                 false,
@@ -556,7 +569,7 @@ mod tests {
         })
         .to_string();
         write_private_cache(&cache_path, &original);
-        let server = TestHttpServer::start(|_| ("200 OK", "1.1.1.1", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "1.1.1.1"));
         let urls = server_urls(&[&server]);
         let urls = url_refs(&urls);
 
@@ -565,7 +578,7 @@ mod tests {
             cache_warning,
             ..
         } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &urls,
             &[],
             false,
@@ -606,7 +619,7 @@ mod tests {
         let directory = TestDirectory::new();
         let cache_directory = directory.path().join("saltbox").join("facts");
         let cache_path = cache_directory.join("public-ip.json");
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.80", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.80"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
@@ -617,7 +630,7 @@ mod tests {
             cache_warning,
             ..
         } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -645,12 +658,12 @@ mod tests {
         let cache_directory = cache_namespace.join("facts");
         symlink(&redirected_directory, &cache_directory).unwrap();
         let cache_path = cache_directory.join("public-ip.json");
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.81", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.81"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -684,12 +697,12 @@ mod tests {
         })
         .to_string();
         fs::write(&redirected_cache_path, &redirected_cache).unwrap();
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.91", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.91"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -723,12 +736,12 @@ mod tests {
         })
         .to_string();
         fs::write(&redirected_cache_path, &redirected_cache).unwrap();
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.93", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.93"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -751,12 +764,12 @@ mod tests {
         let cache_namespace = directory.path().join("saltbox");
         let cache_directory = cache_namespace.join("facts");
         let cache_path = cache_directory.join("public-ip.json");
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.82", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.82"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -782,12 +795,12 @@ mod tests {
         let cache_path = directory.cache_path();
         let cache_directory = cache_path.parent().unwrap();
         let lock_path = cache_directory.join(".public-ip.lock");
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.83", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.83"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -828,17 +841,16 @@ mod tests {
             })
             .to_string(),
         );
-        let ipv4_server =
-            TestHttpServer::start(|_| ("200 OK", "8.8.4.2", Duration::from_millis(5)));
+        let ipv4_server = TestHttpServer::start(|_| ("200 OK", "8.8.4.2"));
         let unexpected_ipv6 =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
         let ipv4_urls = server_urls(&[&ipv4_server]);
         let ipv6_urls = server_urls(&[&unexpected_ipv6]);
         let ipv4_urls = url_refs(&ipv4_urls);
         let ipv6_urls = url_refs(&ipv6_urls);
 
         let PublicIpResolution { ipv4, ipv6, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &ipv6_urls,
             true,
@@ -864,16 +876,15 @@ mod tests {
             .to_string(),
         );
         let unexpected_ipv4 =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
-        let ipv6_server =
-            TestHttpServer::start(|_| ("200 OK", "2606:4700:4700::4", Duration::from_millis(5)));
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
+        let ipv6_server = TestHttpServer::start(|_| ("200 OK", "2606:4700:4700::4"));
         let ipv4_urls = server_urls(&[&unexpected_ipv4]);
         let ipv6_urls = server_urls(&[&ipv6_server]);
         let ipv4_urls = url_refs(&ipv4_urls);
         let ipv6_urls = url_refs(&ipv6_urls);
 
         let PublicIpResolution { ipv4, ipv6, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &ipv6_urls,
             true,
@@ -948,8 +959,7 @@ mod tests {
             let directory = TestDirectory::new();
             let cache_path = directory.cache_path();
             write_private_cache(&cache_path, cache);
-            let server =
-                TestHttpServer::start(|_| ("200 OK", "8.8.4.99", Duration::from_millis(5)));
+            let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.99"));
             let ipv4_urls = server_urls(&[&server]);
             let ipv4_urls = url_refs(&ipv4_urls);
 
@@ -958,7 +968,7 @@ mod tests {
                 cache_warning,
                 ..
             } = resolve_public_ips_with_policy(
-                &Client::new(),
+                &test_client(),
                 &ipv4_urls,
                 &[],
                 false,
@@ -988,7 +998,7 @@ mod tests {
         boundary_cache.resize(4096, b' ');
         write_private_cache(&boundary_cache_path, &boundary_cache);
         let unexpected_server =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
         let boundary_urls = server_urls(&[&unexpected_server]);
         let boundary_urls = url_refs(&boundary_urls);
 
@@ -996,7 +1006,7 @@ mod tests {
             ipv4: boundary_ipv4,
             ..
         } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &boundary_urls,
             &[],
             false,
@@ -1013,13 +1023,12 @@ mod tests {
         let mut oversized_cache = cache_json.into_bytes();
         oversized_cache.resize(4097, b' ');
         write_private_cache(&oversized_cache_path, &oversized_cache);
-        let live_server =
-            TestHttpServer::start(|_| ("200 OK", "8.8.4.71", Duration::from_millis(5)));
+        let live_server = TestHttpServer::start(|_| ("200 OK", "8.8.4.71"));
         let oversized_urls = server_urls(&[&live_server]);
         let oversized_urls = url_refs(&oversized_urls);
 
         let oversized_resolution = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &oversized_urls,
             &[],
             false,
@@ -1043,13 +1052,12 @@ mod tests {
         let cache_path = directory.cache_path();
         let original = b"{\n  \"version\": 1,\n  \"ipv4\": {\"address\": \"8.8.4.10\", \"observed_at\": 1779999000}\n}\n";
         write_private_cache(&cache_path, original);
-        let server =
-            TestHttpServer::start(|_| ("503 Service Unavailable", "unavailable", Duration::ZERO));
+        let server = TestHttpServer::start(|_| ("503 Service Unavailable", "unavailable"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -1074,17 +1082,15 @@ mod tests {
             "ipv6": {"address": "2606:4700:4700::10", "observed_at": 1_780_000_000_u64}
         });
         write_private_cache(&cache_path, original_cache.to_string());
-        let ipv4_server =
-            TestHttpServer::start(|_| ("200 OK", "8.8.4.11", Duration::from_millis(5)));
-        let ipv6_server =
-            TestHttpServer::start(|_| ("503 Service Unavailable", "unavailable", Duration::ZERO));
+        let ipv4_server = TestHttpServer::start(|_| ("200 OK", "8.8.4.11"));
+        let ipv6_server = TestHttpServer::start(|_| ("503 Service Unavailable", "unavailable"));
         let ipv4_urls = server_urls(&[&ipv4_server]);
         let ipv6_urls = server_urls(&[&ipv6_server]);
         let ipv4_urls = url_refs(&ipv4_urls);
         let ipv6_urls = url_refs(&ipv6_urls);
 
         let PublicIpResolution { ipv4, ipv6, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &ipv6_urls,
             true,
@@ -1195,6 +1201,11 @@ mod tests {
 
     #[test]
     fn concurrent_complementary_writers_merge_the_latest_cache() {
+        if run_test_in_subprocess(
+            "public_ip::cache::tests::concurrent_complementary_writers_merge_the_latest_cache",
+        ) {
+            return;
+        }
         let directory = TestDirectory::new();
         let cache_path = directory.cache_path();
         let lock_path = cache_path.parent().unwrap().join(".public-ip.lock");
@@ -1214,52 +1225,56 @@ mod tests {
             .unwrap();
         lock_file.try_lock().unwrap();
 
-        let start = Arc::new(Barrier::new(3));
+        let start = TestSignal::new("both writers loaded their old snapshots");
         let (started_sender, started_receiver) = mpsc::sync_channel(2);
         let ipv4_cache_path = cache_path.clone();
-        let ipv4_start = Arc::clone(&start);
+        let ipv4_start = start.clone();
         let ipv4_started = started_sender.clone();
         let ipv4_writer = thread::spawn(move || {
             let snapshot = load(&ipv4_cache_path, now).cache.unwrap();
             assert_eq!(snapshot.ipv4.unwrap().address, "8.8.4.10");
-            ipv4_start.wait();
             ipv4_started.send(()).unwrap();
+            ipv4_start.wait_blocking();
             merge_successful_entries_with_timeout(
                 &ipv4_cache_path,
                 Some("8.8.4.11".to_string()),
                 None,
                 now,
                 || now,
-                CACHE_LOCK_TIMEOUT,
+                TEST_TIMEOUT,
             )
         });
 
         let ipv6_cache_path = cache_path.clone();
-        let ipv6_start = Arc::clone(&start);
+        let ipv6_start = start.clone();
         let ipv6_started = started_sender.clone();
         let ipv6_writer = thread::spawn(move || {
             let snapshot = load(&ipv6_cache_path, now).cache.unwrap();
             assert_eq!(snapshot.ipv6.unwrap().address, "2606:4700:4700::10");
-            ipv6_start.wait();
             ipv6_started.send(()).unwrap();
+            ipv6_start.wait_blocking();
             merge_successful_entries_with_timeout(
                 &ipv6_cache_path,
                 None,
                 Some("2606:4700:4700::11".to_string()),
                 now,
                 || now,
-                CACHE_LOCK_TIMEOUT,
+                TEST_TIMEOUT,
             )
         });
 
-        start.wait();
-        started_receiver.recv().unwrap();
-        started_receiver.recv().unwrap();
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("writer did not load its snapshot");
+        started_receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("writer did not load its snapshot");
         let while_locked: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
         assert_eq!(while_locked, old_cache);
         lock_file.unlock().unwrap();
         drop(lock_file);
+        start.notify();
 
         ipv4_writer.join().unwrap().write_result.unwrap();
         ipv6_writer.join().unwrap().write_result.unwrap();
@@ -1282,7 +1297,70 @@ mod tests {
     }
 
     #[test]
+    fn contended_lock_retries_only_until_its_configured_deadline() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("lock");
+        let holder = File::create(&path).unwrap();
+        holder.try_lock().unwrap();
+        let contender = File::open(&path).unwrap();
+        for (limit, expected_waits) in [
+            (Duration::ZERO, vec![]),
+            (
+                Duration::from_millis(25),
+                vec![
+                    Duration::from_millis(10),
+                    Duration::from_millis(10),
+                    Duration::from_millis(5),
+                ],
+            ),
+        ] {
+            let elapsed = Cell::new(Duration::ZERO);
+            let mut waits = Vec::new();
+            let error = lock_with_retry(
+                &contender,
+                limit,
+                || elapsed.get(),
+                |delay| {
+                    waits.push(delay);
+                    elapsed.set(elapsed.get() + delay);
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(waits, expected_waits);
+            assert_eq!(elapsed.get(), limit);
+        }
+    }
+
+    #[test]
+    fn contended_lock_can_succeed_on_a_later_attempt() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("lock");
+        let holder = File::create(&path).unwrap();
+        holder.try_lock().unwrap();
+        let contender = File::open(&path).unwrap();
+        let elapsed = Cell::new(Duration::ZERO);
+        lock_with_retry(
+            &contender,
+            Duration::from_millis(25),
+            || elapsed.get(),
+            |delay| {
+                elapsed.set(elapsed.get() + delay);
+                holder.unlock().unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(elapsed.get(), CACHE_LOCK_RETRY_DELAY);
+        assert!(matches!(holder.try_lock(), Err(TryLockError::WouldBlock)));
+    }
+
+    #[test]
     fn held_cache_lock_times_out_without_changing_live_result() {
+        if run_test_in_subprocess(
+            "public_ip::cache::tests::held_cache_lock_times_out_without_changing_live_result",
+        ) {
+            return;
+        }
         let directory = TestDirectory::new();
         let cache_path = directory.cache_path();
         let lock_path = cache_path.parent().unwrap().join(".public-ip.lock");
@@ -1300,7 +1378,7 @@ mod tests {
             .open(&lock_path)
             .unwrap();
         lock_file.try_lock().unwrap();
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.21", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.21"));
         let server_url = server.url.clone();
         let thread_cache_path = cache_path.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -1310,79 +1388,71 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let started = Instant::now();
             let result = runtime.block_on(async {
                 let urls = [server_url.as_str()];
+                let mut policy = test_lookup_policy(&thread_cache_path, 1_780_001_000);
+                policy.cache_lock_timeout = Duration::ZERO;
                 resolve_public_ips_with_policy(
-                    &Client::new(),
+                    &test_client(),
                     &urls,
                     &[],
                     false,
                     "IPv6 unavailable".to_string(),
-                    test_lookup_policy(&thread_cache_path, 1_780_001_000),
+                    policy,
                 )
                 .await
             });
-            sender.send((result, started.elapsed())).unwrap();
+            sender.send(result).unwrap();
         });
 
-        let received = receiver.recv_timeout(Duration::from_secs(2));
+        let received = receiver.recv_timeout(TEST_TIMEOUT);
         lock_file.unlock().unwrap();
         drop(lock_file);
         resolver_thread.join().unwrap();
 
-        let (resolution, elapsed) = received.expect("lock acquisition must time out");
+        let resolution = received.unwrap_or_else(|error| {
+            panic!(
+                "held lock did not time out: {error}; {}",
+                server.diagnostics()
+            )
+        });
         assert_eq!(resolution.ipv4, successful("8.8.4.21"));
         assert_eq!(
             resolution.cache_warning.as_deref(),
             Some("cache write skipped: timed out acquiring cache lock")
         );
-        assert!(elapsed >= Duration::from_millis(25), "elapsed: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(250), "elapsed: {elapsed:?}");
         assert_eq!(fs::read_to_string(&cache_path).unwrap(), original_cache);
         assert_eq!(server.request_count(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn contended_cache_write_does_not_block_the_async_executor() {
+    async fn cache_persistence_runs_outside_the_async_executor() {
         let directory = TestDirectory::new();
         let cache_path = directory.cache_path();
-        let lock_path = cache_path.parent().unwrap().join(".public-ip.lock");
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&lock_path)
-            .unwrap();
-        lock_file.try_lock().unwrap();
-        let server = TestHttpServer::start(|_| ("200 OK", "1.1.1.1", Duration::from_millis(5)));
+        let now = 1_780_001_000;
+        let server = TestHttpServer::start(|_| ("200 OK", "1.1.1.1"));
         let urls = server_urls(&[&server]);
         let urls = url_refs(&urls);
-        let client = Client::new();
-        let started = Instant::now();
-
-        let (result, timer_elapsed) = tokio::join!(
-            resolve_public_ips_with_policy(
-                &client,
-                &urls,
-                &[],
-                false,
-                "IPv6 unavailable".to_string(),
-                test_lookup_policy(&cache_path, 1_780_001_000),
-            ),
-            async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                started.elapsed()
-            }
-        );
-
-        lock_file.unlock().unwrap();
+        let mut policy = test_lookup_policy(&cache_path, now);
+        // The clock is sampled inside the real persistence operation, after lock
+        // acquisition. An inline blocking call now fails regardless of its speed.
+        policy.reload_validation_clock =
+            crate::public_ip::CacheValidationClock::CheckWorkerThread {
+                now,
+                executor: thread::current().id(),
+            };
+        let result = resolve_public_ips_with_policy(
+            &test_client(),
+            &urls,
+            &[],
+            false,
+            "IPv6 unavailable".to_string(),
+            policy,
+        )
+        .await;
         assert_eq!(result.ipv4, successful("1.1.1.1"));
-        assert!(
-            timer_elapsed < Duration::from_millis(500),
-            "executor was blocked for {timer_elapsed:?}"
-        );
+        assert_eq!(result.cache_warning, None);
+        assert!(cache_path.is_file());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1405,13 +1475,12 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let server =
-                TestHttpServer::start(|_| ("200 OK", "8.8.4.30", Duration::from_millis(5)));
+            let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.30"));
             let urls = server_urls(&[&server]);
             let urls = url_refs(&urls);
 
             let PublicIpResolution { ipv4, .. } = resolve_public_ips_with_policy(
-                &Client::new(),
+                &test_client(),
                 &urls,
                 &[],
                 false,
@@ -1454,12 +1523,12 @@ mod tests {
             })
             .to_string(),
         );
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.11", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.11"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
         let PublicIpResolution { ipv4, ipv6, .. } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             true,
@@ -1493,7 +1562,7 @@ mod tests {
         let directory = TestDirectory::new();
         let non_regular_cache_path = directory.cache_path();
         fs::create_dir(&non_regular_cache_path).unwrap();
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.50", Duration::from_millis(5)));
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.50"));
         let ipv4_urls = server_urls(&[&server]);
         let ipv4_urls = url_refs(&ipv4_urls);
 
@@ -1502,7 +1571,7 @@ mod tests {
             cache_warning,
             ..
         } = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &[],
             false,
@@ -1535,17 +1604,16 @@ mod tests {
             })
             .to_string(),
         );
-        let ipv4_server =
-            TestHttpServer::start(|_| ("200 OK", "8.8.4.20", Duration::from_millis(5)));
+        let ipv4_server = TestHttpServer::start(|_| ("200 OK", "8.8.4.20"));
         let unexpected_ipv6 =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
         let ipv4_urls = server_urls(&[&ipv4_server]);
         let ipv6_urls = server_urls(&[&unexpected_ipv6]);
         let ipv4_urls = url_refs(&ipv4_urls);
         let ipv6_urls = url_refs(&ipv6_urls);
 
         let first = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &ipv6_urls,
             true,
@@ -1564,16 +1632,16 @@ mod tests {
         );
 
         let unexpected_ipv4 =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
         let unexpected_ipv6 =
-            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected", Duration::ZERO));
+            TestHttpServer::start(|_| ("500 Internal Server Error", "unexpected"));
         let ipv4_urls = server_urls(&[&unexpected_ipv4]);
         let ipv6_urls = server_urls(&[&unexpected_ipv6]);
         let ipv4_urls = url_refs(&ipv4_urls);
         let ipv6_urls = url_refs(&ipv6_urls);
 
         let second = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &ipv4_urls,
             &ipv6_urls,
             true,
@@ -1597,7 +1665,7 @@ mod tests {
         let observed_at = 1_780_001_000;
         let reload_validation_time = observed_at + 2;
         let writer_b_cache_path = cache_path.clone();
-        let server = TestHttpServer::start_with_handler(move |stream, _| {
+        let server = TestHttpServer::start_with_handler(move |request, _| {
             write_private_cache(
                 &writer_b_cache_path,
                 json!({
@@ -1609,13 +1677,14 @@ mod tests {
                 })
                 .to_string(),
             );
-            handle_test_request(stream, ("200 OK", "8.8.4.13", Duration::ZERO));
+            request.record("newer IPv6 cache entry written");
+            request.respond("200 OK", "8.8.4.13");
         });
         let urls = server_urls(&[&server]);
         let urls = url_refs(&urls);
 
         let resolution = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &urls,
             &[],
             false,
@@ -1647,16 +1716,17 @@ mod tests {
         let directory = TestDirectory::new();
         let cache_path = directory.cache_path();
         let handler_cache_path = cache_path.clone();
-        let server = TestHttpServer::start_with_handler(move |stream, _| {
+        let server = TestHttpServer::start_with_handler(move |request, _| {
             write_private_cache(&handler_cache_path, "{not json");
-            handle_test_request(stream, ("200 OK", "8.8.4.22", Duration::ZERO));
+            request.record("malformed cache entry written");
+            request.respond("200 OK", "8.8.4.22");
         });
         let urls = server_urls(&[&server]);
         let urls = url_refs(&urls);
         let now = 1_780_001_000;
 
         let resolution = resolve_public_ips_with_policy(
-            &Client::new(),
+            &test_client(),
             &urls,
             &[],
             false,
@@ -1680,6 +1750,13 @@ mod tests {
 
     #[test]
     fn fifo_cache_target_is_a_bounded_soft_miss() {
+        if run_test_in_subprocess(
+            "public_ip::cache::tests::fifo_cache_target_is_a_bounded_soft_miss",
+        ) {
+            return;
+        }
+        // A blocking-open regression is contained and killed in the child,
+        // rather than leaving a detached thread in the test process.
         let directory = TestDirectory::new();
         let fifo_path = directory.cache_path();
         assert!(Command::new("mkfifo")
@@ -1687,38 +1764,19 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(fs::symlink_metadata(&fifo_path)
-            .unwrap()
-            .file_type()
-            .is_fifo());
-        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.60", Duration::from_millis(5)));
-        let server_url = server.url.clone();
-        let thread_fifo_path = fifo_path.clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
-
-        thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let result = runtime.block_on(async {
-                let urls = [server_url.as_str()];
-                resolve_public_ips_with_policy(
-                    &Client::new(),
-                    &urls,
-                    &[],
-                    false,
-                    "IPv6 unavailable".to_string(),
-                    test_lookup_policy(&thread_fifo_path, 1_780_001_000),
-                )
-                .await
-            });
-            sender.send(result).unwrap();
-        });
-
-        let resolution = receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("FIFO cache resolution must not block");
+        let server = TestHttpServer::start(|_| ("200 OK", "8.8.4.60"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resolution = runtime.block_on(resolve_public_ips_with_policy(
+            &test_client(),
+            &[&server.url],
+            &[],
+            false,
+            "IPv6 unavailable".to_string(),
+            test_lookup_policy(&fifo_path, 1_780_001_000),
+        ));
         assert_eq!(resolution.ipv4, successful("8.8.4.60"));
         assert_eq!(server.request_count(), 1);
         assert!(fs::symlink_metadata(&fifo_path)
