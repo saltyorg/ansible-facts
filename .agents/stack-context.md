@@ -1,9 +1,9 @@
 # Stack Context
 
-Generated: 2026-09-04
+Generated: 2026-10-26
 
 ## Stack
-- **Language**: Rust 2021 edition; MSRV 1.89; Linux/Unix-specific host integration
+- **Language**: Rust 2021 edition; MSRV is `package.rust-version` in Cargo.toml; Linux/Unix-specific host integration
 - **Framework**: No web framework; Tokio current-thread async runtime and Reqwest HTTP client
 - **Data**: Serde and serde_json for the executable Ansible-fact JSON contract
 - **Build**: Cargo with a committed lockfile; native release builds and static MUSL cross-builds
@@ -15,7 +15,8 @@ Generated: 2026-09-04
 ## Secondary Languages
 - YAML (GitHub Actions CI and release automation)
 - Shell (embedded in workflow steps for release validation and packaging)
-- JSON (Renovate dependency-update policy)
+- JSON (Renovate dependency-update policy; routine updates automerge after checks pass)
+- TOML (`deny.toml` cargo-deny supply-chain policy)
 
 ## Conventions
 - Error handling: `io::Result` for required reads; named lookup outcomes; cache failures stay soft and surface through `ip.cache_warning`
@@ -28,9 +29,9 @@ Generated: 2026-09-04
 - `cargo clippy --all-targets --all-features --locked -- -D warnings`
 - `cargo test --all-targets --all-features --locked`
 - `cargo test --release --all-targets --all-features --locked` and release build
-- Rust 1.89.0 locked all-target tests and release build
-- `cargo audit --deny warnings` with cargo-audit 0.22.2
-- Actionlint 1.7.12 with ShellCheck
+- MSRV toolchain (read from Cargo.toml) locked all-target tests and release build
+- `cargo deny --locked check`: RustSec advisories, yanked/unsound crates, licenses, bans, sources
+- Actionlint with ShellCheck and zizmor (`.github/zizmor.yml`); tool versions are Renovate-annotated in `ci.yml`
 
 ## Release Gates
 - Validate tag-derived SemVer and synchronize `Cargo.toml`/`Cargo.lock`
