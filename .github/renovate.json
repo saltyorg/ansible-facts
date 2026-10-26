@@ -22,6 +22,14 @@
             "depNameTemplate": "rust",
             "datasourceTemplate": "rust-version",
             "versioningTemplate": "rust-release-channel"
+        },
+        {
+            "customType": "regex",
+            "description": "Maintain annotated tool versions in workflows",
+            "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+            "matchStrings": [
+                "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)\\s*\\n[^\\n]*?(?:@|:\\s*)(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+            ]
         }
     ],
     "labels": [
@@ -58,6 +66,7 @@
                 "minor",
                 "patch"
             ],
+            "automerge": true,
             "labels": [
                 "dependencies",
                 "github-actions"
@@ -80,10 +89,19 @@
                 "minor",
                 "patch"
             ],
+            "automerge": true,
             "labels": [
                 "dependencies",
                 "rust"
             ]
+        },
+        {
+            "description": "Workflow tool updates",
+            "matchManagers": ["custom.regex"],
+            "matchDepNames": ["!rust"],
+            "matchUpdateTypes": ["minor", "patch"],
+            "automerge": true,
+            "labels": ["dependencies", "github-actions"]
         },
         {
             "description": "Major Rust crate updates",
@@ -92,7 +110,9 @@
             "labels": ["dependencies", "rust", "major"]
         }
     ],
-    "rebaseWhen": "conflicted",
+    "rebaseWhen": "behind-base-branch",
+    "platformAutomerge": false,
+    "osvVulnerabilityAlerts": true,
     "vulnerabilityAlerts": {
         "enabled": true,
         "addLabels": [
@@ -105,6 +125,8 @@
     "commitMessageExtra": "to {{newVersion}}",
     "prBodyTemplate": "{{{header}}}{{{table}}}{{{notes}}}{{{changelogs}}}{{{configDescription}}}{{{controls}}}{{{footer}}}",
     "lockFileMaintenance": {
-        "enabled": true
+        "enabled": true,
+        "automerge": true,
+        "schedule": ["before 5am"]
     }
 }
