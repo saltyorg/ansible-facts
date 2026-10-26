@@ -1,5 +1,8 @@
 name: Security advisories
 
+# Issues track the latest published release, because that is the binary Saltbox
+# installs. Main is scanned too, so issues show when a fix only awaits a release.
+
 on:
   push:
     branches:
@@ -12,6 +15,8 @@ on:
     # After Renovate's daily lockfile maintenance window.
     - cron: '30 6 * * *'
   workflow_dispatch:
+  # Called by the release workflow once a release is published.
+  workflow_call:
 
 permissions: {}
 
@@ -21,17 +26,42 @@ concurrency:
 
 jobs:
   scan:
-    name: Scan lockfile
+    name: Scan release and main lockfiles
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
       findings: ${{ steps.scan.outputs.findings }}
+      release: ${{ steps.release.outputs.tag }}
+      main-sha: ${{ steps.scan.outputs.main-sha }}
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Resolve latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$(gh release view --json tagName --jq .tagName)"
+          if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "Latest release tag '${tag}' is not a version tag." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out main
+        uses: actions/checkout@v7
         with:
+          ref: ${{ github.event.repository.default_branch || 'main' }}
+          path: main
+          persist-credentials: false
+
+      - name: Check out latest release
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+          path: release
           persist-credentials: false
 
       - name: Install cargo-deny
@@ -43,45 +73,61 @@ jobs:
       - name: Collect advisories and yanked crates
         id: scan
         run: |
-          set +e
-          cargo deny --locked --format json check advisories 2> deny.jsonl
-          status=$?
-          set -e
+          # Both lockfiles are judged by main's current policy.
+          scan() {
+            local status errors
+            set +e
+            cargo deny --manifest-path "$1/Cargo.toml" --config main/deny.toml \
+              --locked --format json check advisories 2> "$1.jsonl"
+            status=$?
+            set -e
 
-          # Never report "all clear" from a scan that did not complete.
-          errors="$(jq -s '[.[] | select(.type == "summary") | .fields.advisories.errors] | first // empty' deny.jsonl)"
-          if [ -z "$errors" ] || { [ "$status" -ne 0 ] && [ "$errors" -eq 0 ]; }; then
-            cat deny.jsonl >&2
-            echo "cargo-deny exited ${status} without a usable advisories summary." >&2
-            exit 1
-          fi
+            # Never report "all clear" from a scan that did not complete.
+            errors="$(jq -s '[.[] | select(.type == "summary") | .fields.advisories.errors] | first // empty' "$1.jsonl")"
+            if [ -z "$errors" ] || { [ "$status" -ne 0 ] && [ "$errors" -eq 0 ]; }; then
+              cat "$1.jsonl" >&2
+              echo "cargo-deny exited ${status} on $1 without a usable advisories summary." >&2
+              exit 1
+            fi
 
-          findings="$(jq -sc '
-            [ .[]
-              | select(.type == "diagnostic")
-              | .fields
-              | select(.severity == "error" or .severity == "warning")
-              | select(.advisory != null or .code == "yanked")
-              | . as $diagnostic
-              | .graphs[].Krate
-              | {
-                  key: ($diagnostic.advisory.id // "yanked:\(.name)@\(.version)"),
-                  kind: $diagnostic.code,
-                  crate: .name,
-                  version: .version,
-                  summary: ($diagnostic.advisory.title // "Yanked crate version"),
-                  url: (if $diagnostic.advisory
-                        then "https://rustsec.org/advisories/\($diagnostic.advisory.id)"
-                        else "https://crates.io/crates/\(.name)/versions"
-                        end),
-                  solution: ([$diagnostic.notes[]? | select(startswith("Solution: "))] | first // "")
-                }
-            ]
-            | group_by(.key)
-            | map(.[0] + {versions: (map(.version) | unique | join(", "))} | del(.version))
-          ' deny.jsonl)"
-          echo "findings=${findings}" >> "$GITHUB_OUTPUT"
-          jq -r '.[] | "\(.key) \(.crate) \(.versions)"' <<< "$findings"
+            jq -sc '
+              [ .[]
+                | select(.type == "diagnostic")
+                | .fields
+                | select(.severity == "error" or .severity == "warning")
+                | select(.advisory != null or .code == "yanked")
+                | . as $diagnostic
+                | .graphs[].Krate
+                | {
+                    key: ($diagnostic.advisory.id // "yanked:\(.name)@\(.version)"),
+                    kind: $diagnostic.code,
+                    crate: .name,
+                    version: .version,
+                    summary: ($diagnostic.advisory.title // "Yanked crate version"),
+                    url: (if $diagnostic.advisory
+                          then "https://rustsec.org/advisories/\($diagnostic.advisory.id)"
+                          else "https://crates.io/crates/\(.name)/versions"
+                          end),
+                    solution: ([$diagnostic.notes[]? | select(startswith("Solution: "))] | first // "")
+                  }
+              ]
+              | group_by(.key)
+              | map(.[0] + {versions: (map(.version) | unique | join(", "))} | del(.version))
+            ' "$1.jsonl"
+          }
+
+          release_findings="$(scan release)"
+          main_findings="$(scan main)"
+          findings="$(jq -c --argjson main "$main_findings" '
+            ($main | map(.key)) as $on_main
+            | map(. + {fixed_on_main: (.key as $key | $on_main | index($key) | not)})
+          ' <<< "$release_findings")"
+
+          {
+            echo "findings=${findings}"
+            echo "main-sha=$(git -C main rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          jq -r '.[] | "\(.key) \(.crate) \(.versions) fixed_on_main=\(.fixed_on_main)"' <<< "$findings"
 
   issues:
     name: Sync advisory issues
@@ -96,33 +142,53 @@ jobs:
       ASSIGNEE: saltydk
       LABEL: security-advisory
       FINDINGS: ${{ needs.scan.outputs.findings }}
-      HEAD_SHA: ${{ github.sha }}
+      RELEASE: ${{ needs.scan.outputs.release }}
+      MAIN_SHA: ${{ needs.scan.outputs.main-sha }}
 
     steps:
-      - name: Open new and close resolved advisory issues
+      - name: Open new, annotate fixed and close released advisory issues
         run: |
           if ! gh label list --limit 200 --json name --jq '.[].name' | grep -qx "$LABEL"; then
             gh label create "$LABEL" --color B60205 \
-              --description "RustSec advisory or yanked crate in Cargo.lock; closed automatically when resolved"
+              --description "RustSec advisory or yanked crate in the latest release; closed when a release resolves it"
           fi
 
           open_issues="$(gh issue list --state open --label "$LABEL" --limit 200 --json number,body)"
           marker_key='capture("<!-- security-finding: (?<key>[^ ]+) -->").key? // empty'
+          fixed_marker='<!-- fixed-on-main -->'
+          fixed_note="Fixed on main at ${MAIN_SHA}; publish a release to close this."
 
           jq -c '.[]' <<< "$FINDINGS" | while read -r finding; do
             key="$(jq -r '.key' <<< "$finding")"
-            if jq -e --arg key "$key" "any(.[]; (.body | ${marker_key}) == \$key)" <<< "$open_issues" > /dev/null; then
+            fixed_on_main="$(jq -r '.fixed_on_main' <<< "$finding")"
+            existing="$(jq -c --arg key "$key" "map(select((.body | ${marker_key}) == \$key)) | first // empty" <<< "$open_issues")"
+
+            if [ -n "$existing" ]; then
+              number="$(jq -r '.number' <<< "$existing")"
+              existing_body="$(jq -r '.body' <<< "$existing")"
+              if [ "$fixed_on_main" = "true" ] && [[ "$existing_body" != *"$fixed_marker"* ]]; then
+                gh issue comment "$number" --body "$fixed_note"
+                gh issue edit "$number" --body "${existing_body}
+          ${fixed_marker}"
+              fi
               continue
             fi
+
             title="$(jq -r '
               if .kind == "yanked" then "Yanked crate: \(.crate) \(.versions)"
               else "\(.key): \(.crate) \(.versions) - \(.summary)" end' <<< "$finding")"
-            body="$(jq -r '
+            body="$(jq -r --arg release "$RELEASE" '
               "<!-- security-finding: \(.key) -->\n" +
-              "`cargo deny check advisories` reports **\(.kind)** for `\(.crate)` \(.versions) in `Cargo.lock`.\n\n" +
+              "Release `\($release)` ships `\(.crate)` \(.versions), which `cargo deny check advisories` reports as **\(.kind)**.\n\n" +
               "- Details: \(.url)\n" +
               (if .solution != "" then "- \(.solution)\n" else "" end) +
-              "\nThis issue closes automatically once a scan of `main` no longer reports it."' <<< "$finding")"
+              "\nThis issue closes automatically once the latest release no longer contains it."' <<< "$finding")"
+            if [ "$fixed_on_main" = "true" ]; then
+              body="${body}
+
+          ${fixed_note}
+          ${fixed_marker}"
+            fi
             gh issue create --title "$title" --label "$LABEL" --assignee "$ASSIGNEE" --body "$body"
           done
 
@@ -130,7 +196,7 @@ jobs:
             (\$findings | map(.key)) as \$current
             | .[]
             | (.body | ${marker_key}) as \$key
-            | select(\$key != \"\" and (\$current | index(\$key) | not))
+            | select(\$current | index(\$key) | not)
             | .number" <<< "$open_issues" | while read -r number; do
-            gh issue close "$number" --comment "No longer reported by \`cargo deny check advisories\` at ${HEAD_SHA}."
+            gh issue close "$number" --comment "No longer present in release \`${RELEASE}\`."
           done

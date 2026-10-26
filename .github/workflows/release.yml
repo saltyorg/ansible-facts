@@ -197,3 +197,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: release/*
+
+  security:
+    name: Sync advisory issues
+    needs: release
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/security.yml

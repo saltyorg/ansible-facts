@@ -34,8 +34,9 @@ Generated: 2026-10-26
 - Actionlint with ShellCheck and zizmor (`.github/zizmor.yml`); tool versions are Renovate-annotated in `ci.yml`
 
 ## Security Tracking
-- `security.yml` scans `main` daily and on lockfile changes; each RustSec advisory or yanked crate gets one
-  assigned `security-advisory` issue, closed automatically once no longer reported
+- `security.yml` scans the latest release's `Cargo.lock` (what Saltbox installs) daily, on main lockfile changes
+  and after each release; each RustSec advisory or yanked crate gets one assigned `security-advisory` issue,
+  noted when already fixed on main, and closed once a release no longer contains it
 
 ## Release Gates
 - Validate tag-derived SemVer and synchronize `Cargo.toml`/`Cargo.lock`
