@@ -1,0 +1,41 @@
+# Supply-chain policy enforced by `cargo deny check` in CI.
+
+[graph]
+# Release targets plus the native CI host.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "armv7-unknown-linux-musleabihf",
+    "arm-unknown-linux-musleabihf",
+    "armv5te-unknown-linux-musleabi",
+]
+all-features = true
+
+[advisories]
+# RustSec vulnerabilities, unmaintained, unsound and yanked crates all fail.
+# An ignore entry must name the advisory ID and explain why it does not apply.
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

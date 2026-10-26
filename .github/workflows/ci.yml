@@ -80,18 +80,22 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-  audit:
-    name: Dependency audit
+  deny:
+    name: Dependency policy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          # renovate: datasource=crate depName=cargo-deny
+          tool: cargo-deny@0.20.2
 
-      - name: Audit dependencies
-        run: cargo audit --deny warnings
+      - name: Check advisories, licenses, bans and sources
+        run: cargo deny --locked check
 
   workflow-lint:
     name: Workflow lint
