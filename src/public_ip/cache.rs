@@ -1,4 +1,5 @@
 use super::address::{canonical_public_ip, AddressFamily};
+use libc::{O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -19,9 +20,6 @@ const CACHE_NAMESPACE_MODE: u32 = 0o755;
 const CACHE_DIRECTORY_MODE: u32 = 0o700;
 const CACHE_FILE_MODE: u32 = 0o600;
 const CACHE_LOCK_FILE_NAME: &str = ".public-ip.lock";
-const O_DIRECTORY: i32 = 0o200000;
-const O_NONBLOCK: i32 = 0o4000;
-const O_NOFOLLOW: i32 = 0o400000;
 static CACHE_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -612,6 +610,27 @@ mod tests {
         let error = validate_owner(&metadata, other_user).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn symlinked_cache_file_is_ignored() {
+        let directory = TestDirectory::new();
+        let cache_path = directory.cache_path();
+        let redirected_cache_path = cache_path.with_file_name("redirected.json");
+        write_private_cache(
+            &redirected_cache_path,
+            json!({
+                "version": 1,
+                "ipv4": {"address": "8.8.4.92", "observed_at": 1_780_001_000_u64}
+            })
+            .to_string(),
+        );
+        symlink(&redirected_cache_path, &cache_path).unwrap();
+
+        let loaded = load(&cache_path, 1_780_001_100);
+
+        assert!(loaded.cache.is_none());
+        assert_eq!(loaded.warnings, ["cache target is not a regular file"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
