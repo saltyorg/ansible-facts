@@ -33,6 +33,10 @@ Generated: 2026-10-26
 - `cargo deny --locked check`: RustSec advisories, yanked/unsound crates, licenses, bans, sources
 - Actionlint with ShellCheck and zizmor (`.github/zizmor.yml`); tool versions are Renovate-annotated in `ci.yml`
 
+## Security Tracking
+- `security.yml` scans `main` daily and on lockfile changes; each RustSec advisory or yanked crate gets one
+  assigned `security-advisory` issue, closed automatically once no longer reported
+
 ## Release Gates
 - Validate tag-derived SemVer and synchronize `Cargo.toml`/`Cargo.lock`
 - Require reusable CI, cross-build five static MUSL targets, and smoke-test ARMv5 under QEMU before publication

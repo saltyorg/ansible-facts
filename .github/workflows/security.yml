@@ -1,0 +1,136 @@
+name: Security advisories
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/security.yml
+  schedule:
+    # After Renovate's daily lockfile maintenance window.
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-advisories
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Scan lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      findings: ${{ steps.scan.outputs.findings }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          # renovate: datasource=crate depName=cargo-deny
+          tool: cargo-deny@0.20.2
+
+      - name: Collect advisories and yanked crates
+        id: scan
+        run: |
+          set +e
+          cargo deny --locked --format json check advisories 2> deny.jsonl
+          status=$?
+          set -e
+
+          # Never report "all clear" from a scan that did not complete.
+          errors="$(jq -s '[.[] | select(.type == "summary") | .fields.advisories.errors] | first // empty' deny.jsonl)"
+          if [ -z "$errors" ] || { [ "$status" -ne 0 ] && [ "$errors" -eq 0 ]; }; then
+            cat deny.jsonl >&2
+            echo "cargo-deny exited ${status} without a usable advisories summary." >&2
+            exit 1
+          fi
+
+          findings="$(jq -sc '
+            [ .[]
+              | select(.type == "diagnostic")
+              | .fields
+              | select(.severity == "error" or .severity == "warning")
+              | select(.advisory != null or .code == "yanked")
+              | . as $diagnostic
+              | .graphs[].Krate
+              | {
+                  key: ($diagnostic.advisory.id // "yanked:\(.name)@\(.version)"),
+                  kind: $diagnostic.code,
+                  crate: .name,
+                  version: .version,
+                  summary: ($diagnostic.advisory.title // "Yanked crate version"),
+                  url: (if $diagnostic.advisory
+                        then "https://rustsec.org/advisories/\($diagnostic.advisory.id)"
+                        else "https://crates.io/crates/\(.name)/versions"
+                        end),
+                  solution: ([$diagnostic.notes[]? | select(startswith("Solution: "))] | first // "")
+                }
+            ]
+            | group_by(.key)
+            | map(.[0] + {versions: (map(.version) | unique | join(", "))} | del(.version))
+          ' deny.jsonl)"
+          echo "findings=${findings}" >> "$GITHUB_OUTPUT"
+          jq -r '.[] | "\(.key) \(.crate) \(.versions)"' <<< "$findings"
+
+  issues:
+    name: Sync advisory issues
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ASSIGNEE: saltydk
+      LABEL: security-advisory
+      FINDINGS: ${{ needs.scan.outputs.findings }}
+      HEAD_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Open new and close resolved advisory issues
+        run: |
+          if ! gh label list --limit 200 --json name --jq '.[].name' | grep -qx "$LABEL"; then
+            gh label create "$LABEL" --color B60205 \
+              --description "RustSec advisory or yanked crate in Cargo.lock; closed automatically when resolved"
+          fi
+
+          open_issues="$(gh issue list --state open --label "$LABEL" --limit 200 --json number,body)"
+          marker_key='capture("<!-- security-finding: (?<key>[^ ]+) -->").key? // empty'
+
+          jq -c '.[]' <<< "$FINDINGS" | while read -r finding; do
+            key="$(jq -r '.key' <<< "$finding")"
+            if jq -e --arg key "$key" "any(.[]; (.body | ${marker_key}) == \$key)" <<< "$open_issues" > /dev/null; then
+              continue
+            fi
+            title="$(jq -r '
+              if .kind == "yanked" then "Yanked crate: \(.crate) \(.versions)"
+              else "\(.key): \(.crate) \(.versions) - \(.summary)" end' <<< "$finding")"
+            body="$(jq -r '
+              "<!-- security-finding: \(.key) -->\n" +
+              "`cargo deny check advisories` reports **\(.kind)** for `\(.crate)` \(.versions) in `Cargo.lock`.\n\n" +
+              "- Details: \(.url)\n" +
+              (if .solution != "" then "- \(.solution)\n" else "" end) +
+              "\nThis issue closes automatically once a scan of `main` no longer reports it."' <<< "$finding")"
+            gh issue create --title "$title" --label "$LABEL" --assignee "$ASSIGNEE" --body "$body"
+          done
+
+          jq -r --argjson findings "$FINDINGS" "
+            (\$findings | map(.key)) as \$current
+            | .[]
+            | (.body | ${marker_key}) as \$key
+            | select(\$key != \"\" and (\$current | index(\$key) | not))
+            | .number" <<< "$open_issues" | while read -r number; do
+            gh issue close "$number" --comment "No longer reported by \`cargo deny check advisories\` at ${HEAD_SHA}."
+          done
