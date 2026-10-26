@@ -21,17 +21,17 @@ panic = "abort"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.53.1", features = ["macros", "rt", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
 reqwest = { version = "0.13.5", features = ["stream"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 futures-util = "0.3.34"
-libc = "0.2.189"
+libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.8.2"
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 [[bench]]
 name = "local_paths"
