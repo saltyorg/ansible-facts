@@ -43,6 +43,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Validate architecture label
         env:
@@ -66,7 +68,7 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="$REF_NAME"
             # Remove 'v' prefix if present
             VERSION="${VERSION#v}"
@@ -97,7 +99,10 @@ jobs:
           grep '^version = ' Cargo.toml
 
       - name: Install cross
-        run: cargo install cross --version 0.2.5 --locked
+        uses: taiki-e/install-action@v2
+        with:
+          # Keep in step with the ghcr.io/cross-rs images used below.
+          tool: cross@0.2.5
 
       - name: Build Release Binary
         # Keep this cross-build workaround scoped to release artifacts instead

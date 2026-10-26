@@ -1,0 +1,12 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Actions are pinned to release tags that Renovate keeps current.
+        "*": ref-pin
+  self-repository:
+    # Actionlint does not yet understand the `$/` reusable-workflow syntax.
+    disable: true
+  superfluous-actions:
+    # action-gh-release is kept for its multi-file upload handling.
+    disable: true

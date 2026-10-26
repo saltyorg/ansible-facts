@@ -22,6 +22,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -52,6 +54,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Read minimum Rust version
         id: rust_version
@@ -87,6 +91,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -100,14 +106,34 @@ jobs:
   workflow-lint:
     name: Workflow lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # renovate: datasource=docker depName=rhysd/actionlint
+      ACTIONLINT_VERSION: 1.7.12
+      # renovate: datasource=docker depName=ghcr.io/zizmorcore/zizmor
+      ZIZMOR_VERSION: 1.31.1
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Run Actionlint with ShellCheck
         run: |
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/repo" \
             --workdir /repo \
-            rhysd/actionlint:1.7.12 \
+            "rhysd/actionlint:${ACTIONLINT_VERSION}" \
             -shellcheck=shellcheck
+
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm \
+            --env GH_TOKEN \
+            --volume "${GITHUB_WORKSPACE}:/repo:ro" \
+            --workdir /repo \
+            "ghcr.io/zizmorcore/zizmor:${ZIZMOR_VERSION}" \
+            --format github \
+            .
