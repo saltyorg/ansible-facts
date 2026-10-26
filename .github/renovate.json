@@ -115,6 +115,7 @@
     "osvVulnerabilityAlerts": true,
     "vulnerabilityAlerts": {
         "enabled": true,
+        "automerge": true,
         "addLabels": [
             "security",
             "vulnerability"
