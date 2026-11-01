@@ -17,13 +17,13 @@ use tempfile::TempDir;
 mod process;
 
 // A hang safeguard, never a performance assertion or a way to order events.
-pub(super) use process::TEST_TIMEOUT;
+pub(crate) use process::TEST_TIMEOUT;
 
-pub(super) fn test_client() -> Client {
+pub(crate) fn test_client() -> Client {
     Client::builder().no_proxy().build().unwrap()
 }
 
-pub(super) fn run_test_in_subprocess(name: &str) -> bool {
+pub(crate) fn run_test_in_subprocess(name: &str) -> bool {
     const CHILD_TEST: &str = "SALTBOX_FACTS_CHILD_TEST";
     if std::env::var(CHILD_TEST).as_deref() == Ok(name) {
         return false;
@@ -46,7 +46,7 @@ pub(super) fn run_test_in_subprocess(name: &str) -> bool {
     true
 }
 
-pub(super) async fn within_test_deadline<T>(future: impl Future<Output = T>) -> T {
+pub(crate) async fn within_test_deadline<T>(future: impl Future<Output = T>) -> T {
     let (cancel, waiting) = mpsc::channel::<()>();
     // Real time also bounds tests using paused Tokio time. An active blocking
     // task prevents Tokio from auto-advancing while real socket I/O is pending.
@@ -62,20 +62,20 @@ pub(super) async fn within_test_deadline<T>(future: impl Future<Output = T>) -> 
 }
 
 #[derive(Clone)]
-pub(super) struct TestSignal {
+pub(crate) struct TestSignal {
     name: &'static str,
     state: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl TestSignal {
-    pub(super) fn new(name: &'static str) -> Self {
+    pub(crate) fn new(name: &'static str) -> Self {
         Self {
             name,
             state: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 
-    pub(super) fn notify(&self) {
+    pub(crate) fn notify(&self) {
         *self.state.0.lock().unwrap() = true;
         self.state.1.notify_all();
     }
@@ -104,11 +104,11 @@ impl TestSignal {
         true
     }
 
-    pub(super) fn wait_blocking(&self) {
+    pub(crate) fn wait_blocking(&self) {
         assert!(self.wait_until(|| false));
     }
 
-    pub(super) async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         let signal = self.clone();
         tokio::task::spawn_blocking(move || signal.wait_blocking())
             .await
@@ -116,12 +116,12 @@ impl TestSignal {
     }
 }
 
-pub(super) struct TestDirectory {
+pub(crate) struct TestDirectory {
     directory: TempDir,
 }
 
 impl TestDirectory {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("saltbox-facts-test-")
             .tempdir()
@@ -130,11 +130,11 @@ impl TestDirectory {
         Self { directory }
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.directory.path()
     }
 
-    pub(super) fn cache_path(&self) -> PathBuf {
+    pub(crate) fn cache_path(&self) -> PathBuf {
         let namespace = self.path().join("saltbox");
         let cache_directory = namespace.join("facts");
         fs::create_dir_all(&cache_directory).unwrap();
@@ -144,7 +144,7 @@ impl TestDirectory {
     }
 }
 
-pub(super) fn write_private_cache(path: &Path, contents: impl AsRef<[u8]>) {
+pub(crate) fn write_private_cache(path: &Path, contents: impl AsRef<[u8]>) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
@@ -173,19 +173,21 @@ impl ServerState {
     }
 }
 
-pub(super) struct TestRequest {
+pub(crate) struct TestRequest {
     stream: TcpStream,
     state: Arc<ServerState>,
     number: usize,
+    /// The request target from the request line, e.g. `/path?query`.
+    pub(crate) target: String,
 }
 
 impl TestRequest {
-    pub(super) fn record(&self, event: &str) {
+    pub(crate) fn record(&self, event: &str) {
         self.state
             .record(format!("request {}: {event}", self.number));
     }
 
-    pub(super) fn wait_for(&self, signal: &TestSignal) -> bool {
+    pub(crate) fn wait_for(&self, signal: &TestSignal) -> bool {
         self.record(&format!("waiting for {}", signal.name));
         let released = signal.wait_until(|| self.state.stopped());
         self.record(if released {
@@ -196,7 +198,7 @@ impl TestRequest {
         released
     }
 
-    pub(super) fn respond(self, status: &str, body: &str) {
+    pub(crate) fn respond(self, status: &str, body: &str) {
         self.respond_raw(
             status,
             &[("Content-Length", &body.len().to_string())],
@@ -204,7 +206,7 @@ impl TestRequest {
         );
     }
 
-    pub(super) fn respond_raw(mut self, status: &str, headers: &[(&str, &str)], chunks: &[&[u8]]) {
+    pub(crate) fn respond_raw(mut self, status: &str, headers: &[(&str, &str)], chunks: &[&[u8]]) {
         let mut response = Vec::new();
         write!(response, "HTTP/1.1 {status}\r\nConnection: close\r\n").unwrap();
         for (name, value) in headers {
@@ -229,7 +231,7 @@ impl TestRequest {
         self.write_response(&response);
     }
 
-    pub(super) fn write_response(&mut self, response: &[u8]) {
+    pub(crate) fn write_response(&mut self, response: &[u8]) {
         self.record(&format!("sending {} response bytes", response.len()));
         match self.stream.write_all(response) {
             Ok(()) => self.record("response sent"),
@@ -251,14 +253,14 @@ fn disconnected(error: &io::Error) -> bool {
     )
 }
 
-pub(super) struct TestHttpServer {
-    pub(super) url: String,
+pub(crate) struct TestHttpServer {
+    pub(crate) url: String,
     state: Arc<ServerState>,
     thread: Option<JoinHandle<Vec<String>>>,
 }
 
 impl TestHttpServer {
-    pub(super) fn start<F>(response: F) -> Self
+    pub(crate) fn start<F>(response: F) -> Self
     where
         F: Fn(usize) -> (&'static str, &'static str) + Send + Sync + 'static,
     {
@@ -268,7 +270,7 @@ impl TestHttpServer {
         })
     }
 
-    pub(super) fn start_with_handler<F>(handler: F) -> Self
+    pub(crate) fn start_with_handler<F>(handler: F) -> Self
     where
         F: Fn(TestRequest, usize) + Send + Sync + 'static,
     {
@@ -315,6 +317,7 @@ impl TestHttpServer {
                             state.accepted.notify();
                             let mut reader = BufReader::new(&stream);
                             let mut line = String::new();
+                            let mut target = None;
                             loop {
                                 line.clear();
                                 match reader.read_line(&mut line) {
@@ -323,6 +326,14 @@ impl TestHttpServer {
                                         return;
                                     }
                                     Ok(_) if line == "\r\n" => break,
+                                    Ok(_) if target.is_none() => {
+                                        target = Some(
+                                            line.split_whitespace()
+                                                .nth(1)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        );
+                                    }
                                     Ok(_) => {}
                                     Err(error) if state.stopped() || disconnected(&error) => {
                                         state.record(format!(
@@ -344,6 +355,7 @@ impl TestHttpServer {
                                     stream,
                                     state: Arc::clone(&state),
                                     number,
+                                    target: target.unwrap_or_default(),
                                 },
                                 number,
                             );
@@ -379,11 +391,11 @@ impl TestHttpServer {
         }
     }
 
-    pub(super) fn request_count(&self) -> usize {
+    pub(crate) fn request_count(&self) -> usize {
         self.state.requests.load(Ordering::SeqCst)
     }
 
-    pub(super) fn diagnostics(&self) -> String {
+    pub(crate) fn diagnostics(&self) -> String {
         format!(
             "HTTP fixture {} ({} complete requests):\n{}",
             self.url,
@@ -416,11 +428,11 @@ impl Drop for TestHttpServer {
     }
 }
 
-pub(super) fn server_urls(servers: &[&TestHttpServer]) -> Vec<String> {
+pub(crate) fn server_urls(servers: &[&TestHttpServer]) -> Vec<String> {
     servers.iter().map(|server| server.url.clone()).collect()
 }
 
-pub(super) fn url_refs(urls: &[String]) -> Vec<&str> {
+pub(crate) fn url_refs(urls: &[String]) -> Vec<&str> {
     urls.iter().map(String::as_str).collect()
 }
 

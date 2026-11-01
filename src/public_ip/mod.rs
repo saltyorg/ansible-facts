@@ -261,7 +261,7 @@ pub fn has_global_ipv6_from_if_inet6(content: &str) -> bool {
 }
 
 #[cfg(test)]
-pub(super) mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 mod tests {

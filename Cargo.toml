@@ -21,7 +21,7 @@ panic = "abort"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "process", "rt", "time"] }
 reqwest = { version = "0.13.5", features = ["stream"] }
 serde_json = "1.0.154"
 futures-util = "0.3.34"

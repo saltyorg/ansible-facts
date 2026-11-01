@@ -1,7 +1,7 @@
 use reqwest::Client;
 use saltbox_facts::{
-    get_timezone, has_valid_ipv6, ipv6_unavailable_error, parse_groups, parse_users,
-    resolve_public_ips, sort_json_value, IpOutput, Output,
+    cpu, get_timezone, has_valid_ipv6, ipv6_unavailable_error, parse_groups, parse_users, repo,
+    resolve_public_ips, sort_json_value, ufw, virtualization, IpOutput, Output,
 };
 use std::ffi::OsStr;
 
@@ -12,6 +12,8 @@ const PASSWD_FILE_PATH: &str = "/etc/passwd";
 const IF_INET6_FILE_PATH: &str = "/proc/net/if_inet6";
 const ETC_TIMEZONE_PATH: &str = "/etc/timezone";
 const LOCALTIME_PATH: &str = "/etc/localtime";
+const CPUINFO_PATH: &str = "/proc/cpuinfo";
+const KERNEL_ARCH_PATH: &str = "/proc/sys/kernel/arch";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let users_handle = tokio::task::spawn_blocking(|| parse_users(PASSWD_FILE_PATH));
     let timezone_handle =
         tokio::task::spawn_blocking(|| get_timezone(ETC_TIMEZONE_PATH, LOCALTIME_PATH));
+    let cpu_handle = tokio::task::spawn_blocking(|| cpu::get_cpu(CPUINFO_PATH, KERNEL_ARCH_PATH));
+    let ufw_handle = tokio::task::spawn_blocking(|| ufw::get_ufw(&ufw::UfwPaths::default()));
+    let virtualization_future = virtualization::detect_virtualization(
+        &[virtualization::SYSTEMD_DETECT_VIRT_PATH],
+        virtualization::DETECT_TIMEOUT,
+    );
+    let repo_path = repo::locate_repo(std::env::current_exe().ok().as_deref());
+    let repo_future = repo::get_repo(&client, repo_path, repo::ApiConfig::default());
 
     let ip_future = async {
         let (ipv6_present, ipv6_probe_error) = has_valid_ipv6(IF_INET6_FILE_PATH);
@@ -61,8 +71,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
     };
 
-    let (resolution, groups_result, users_result, timezone_result) =
-        tokio::join!(ip_future, groups_handle, users_handle, timezone_handle);
+    let (
+        resolution,
+        groups_result,
+        users_result,
+        timezone_result,
+        cpu_result,
+        ufw_result,
+        virtualization_data,
+        repo_data,
+    ) = tokio::join!(
+        ip_future,
+        groups_handle,
+        users_handle,
+        timezone_handle,
+        cpu_handle,
+        ufw_handle,
+        virtualization_future,
+        repo_future,
+    );
 
     let groups_data =
         groups_result.map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })??;
@@ -70,6 +97,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         users_result.map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })??;
     let timezone_data =
         timezone_result.map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+    // These sections are diagnostic: a failed task becomes an error field
+    // rather than failing the whole fact.
+    let cpu_data = cpu_result.unwrap_or_else(|error| cpu::CpuData {
+        arch: None,
+        error: Some(format!("CPU task failed: {error}")),
+        flags_missing_for_next_level: None,
+        x86_64_level: None,
+    });
+    let ufw_data = ufw_result.unwrap_or_else(|error| ufw::UfwData {
+        active: None,
+        backend: None,
+        error: Some(format!("UFW task failed: {error}")),
+        installed: false,
+    });
 
     // Saltbox deliberately treats a missing public address as invalid, including
     // when no global IPv6 interface exists and the IPv6 request is skipped.
@@ -77,6 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let failed_ipv6 = resolution.ipv6.address.is_none();
 
     let result = Output {
+        cpu: cpu_data,
+        repo: repo_data,
+        ufw: ufw_data,
+        virtualization: virtualization_data,
         ip: IpOutput {
             cache_warning: resolution.cache_warning,
             public_ip: resolution.ipv4.address.unwrap_or_default(),

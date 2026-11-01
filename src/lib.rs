@@ -1,4 +1,8 @@
+pub mod cpu;
 mod public_ip;
+pub mod repo;
+pub mod ufw;
+pub mod virtualization;
 
 pub use public_ip::{
     has_global_ipv6_from_if_inet6, has_valid_ipv6, ipv6_unavailable_error, resolve_public_ips,
@@ -14,10 +18,14 @@ use std::path::Path;
 
 #[derive(Serialize)]
 pub struct Output {
+    pub cpu: cpu::CpuData,
     pub ip: IpOutput,
     pub groups: HashMap<String, GroupData>,
+    pub repo: repo::RepoData,
     pub users: HashMap<String, UserData>,
     pub timezone: TimezoneData,
+    pub ufw: ufw::UfwData,
+    pub virtualization: virtualization::VirtualizationData,
 }
 
 #[derive(Serialize)]
@@ -192,6 +200,37 @@ mod tests {
     #[test]
     fn output_schema_matches_saltbox_contract() {
         let output = Output {
+            cpu: cpu::CpuData {
+                arch: Some("x86_64".to_string()),
+                error: None,
+                flags_missing_for_next_level: Some(Vec::new()),
+                x86_64_level: Some(4),
+            },
+            repo: repo::RepoData {
+                ahead_by: None,
+                behind_by: None,
+                branch: Some("master".to_string()),
+                commit: None,
+                detached: false,
+                error: None,
+                official: true,
+                path: "/srv/git/saltbox".to_string(),
+                remote_url: None,
+                source: None,
+                status: "unknown",
+                upstream_commit: None,
+            },
+            ufw: ufw::UfwData {
+                active: Some(false),
+                backend: None,
+                error: None,
+                installed: false,
+            },
+            virtualization: virtualization::VirtualizationData {
+                error: None,
+                kind: Some("vm"),
+                virt_type: Some("kvm".to_string()),
+            },
             ip: IpOutput {
                 cache_warning: None,
                 public_ip: String::new(),
@@ -229,6 +268,55 @@ mod tests {
         assert!(value["groups"].is_object());
         assert!(value["users"].is_object());
         assert!(value["timezone"]["timezone"].is_string());
+        assert_eq!(
+            value.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "cpu",
+                "groups",
+                "ip",
+                "repo",
+                "timezone",
+                "ufw",
+                "users",
+                "virtualization",
+            ]
+        );
+        let section_keys = |name: &str| -> Vec<String> {
+            let mut keys: Vec<String> = value[name].as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            section_keys("cpu"),
+            [
+                "arch",
+                "error",
+                "flags_missing_for_next_level",
+                "x86_64_level"
+            ]
+        );
+        assert_eq!(
+            section_keys("repo"),
+            [
+                "ahead_by",
+                "behind_by",
+                "branch",
+                "commit",
+                "detached",
+                "error",
+                "official",
+                "path",
+                "remote_url",
+                "source",
+                "status",
+                "upstream_commit",
+            ]
+        );
+        assert_eq!(
+            section_keys("ufw"),
+            ["active", "backend", "error", "installed"]
+        );
+        assert_eq!(section_keys("virtualization"), ["error", "kind", "type"]);
         assert!(!value
             .as_object()
             .unwrap()
