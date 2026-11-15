@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# Superseded pull request runs are cancelled. Every other run has a group of
+# its own, so pushes, scheduled runs and releases never wait or cancel.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   stable:
     name: Stable Rust
@@ -21,13 +27,14 @@ jobs:
       RUST_BACKTRACE: "1"
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Check formatting
@@ -53,7 +60,7 @@ jobs:
       RUST_BACKTRACE: "1"
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -74,7 +81,7 @@ jobs:
           PY
 
       - name: Install minimum supported Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.rust_version.outputs.toolchain }}
 
@@ -90,12 +97,12 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           # renovate: datasource=crate depName=cargo-deny
           tool: cargo-deny@0.20.2
@@ -108,23 +115,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # renovate: datasource=docker depName=rhysd/actionlint
-      ACTIONLINT_VERSION: 1.7.12
       # renovate: datasource=docker depName=ghcr.io/zizmorcore/zizmor
       ZIZMOR_VERSION: 1.32.0
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Run Actionlint with ShellCheck
-        run: |
-          docker run --rm \
-            --volume "${GITHUB_WORKSPACE}:/repo" \
-            --workdir /repo \
-            "rhysd/actionlint:${ACTIONLINT_VERSION}" \
-            -shellcheck=shellcheck
+      - name: Run jactionlint with ShellCheck
+        uses: saltyorg/github-actions/jactionlint@v1.5.0
 
       - name: Run zizmor
         env:

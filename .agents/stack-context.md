@@ -31,7 +31,7 @@ Generated: 2026-10-26
 - `cargo test --release --all-targets --all-features --locked` and release build
 - MSRV toolchain (read from Cargo.toml) locked all-target tests and release build
 - `cargo deny --locked check`: RustSec advisories, yanked/unsound crates, licenses, bans, sources
-- Actionlint with ShellCheck and zizmor (`.github/zizmor.yml`); tool versions are Renovate-annotated in `ci.yml`
+- jactionlint with ShellCheck through the shared `saltyorg/github-actions/jactionlint` action (strict `default` profile), and zizmor (`.github/zizmor.yml`), whose version is Renovate-annotated in `ci.yml`
 
 ## Security Tracking
 - `security.yml` scans the latest release's `Cargo.lock` (what Saltbox installs) daily, on main lockfile changes

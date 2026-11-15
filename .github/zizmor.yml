@@ -2,11 +2,10 @@ rules:
   unpinned-uses:
     config:
       policies:
-        # Actions are pinned to release tags that Renovate keeps current.
-        "*": ref-pin
+        # Saltyorg actions are consumed by release tag; every other action is
+        # pinned to a commit that Renovate keeps current.
+        "saltyorg/*": ref-pin
+        "*": hash-pin
   self-repository:
     # Actionlint does not yet understand the `$/` reusable-workflow syntax.
-    disable: true
-  superfluous-actions:
-    # action-gh-release is kept for its multi-file upload handling.
     disable: true
