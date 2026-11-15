@@ -4,7 +4,8 @@
         "config:recommended",
         ":semanticCommits",
         ":separateMajorReleases",
-        ":ignoreUnstable"
+        ":ignoreUnstable",
+        "helpers:pinGitHubActionDigestsToSemver"
     ],
     "prConcurrentLimit": 0,
     "prHourlyLimit": 0,
@@ -39,6 +40,16 @@
         {
             "matchCategories": [
                 "docker"
+            ],
+            "pinDigests": false
+        },
+        {
+            "description": "Saltyorg actions are referenced by release tag",
+            "matchManagers": [
+                "github-actions"
+            ],
+            "matchPackageNames": [
+                "saltyorg/github-actions"
             ],
             "pinDigests": false
         },
