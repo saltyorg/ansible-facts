@@ -158,6 +158,8 @@ jobs:
           fixed_marker='<!-- fixed-on-main -->'
           fixed_note="Fixed on main at ${MAIN_SHA}; publish a release to close this."
 
+          # From here on a failing jq stops the sync instead of quietly ending a loop.
+          set -o pipefail
           jq -c '.[]' <<< "$FINDINGS" | while read -r finding; do
             key="$(jq -r '.key' <<< "$finding")"
             fixed_on_main="$(jq -r '.fixed_on_main' <<< "$finding")"
