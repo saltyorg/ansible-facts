@@ -105,7 +105,7 @@ jobs:
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           # renovate: datasource=crate depName=cargo-deny
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny@0.21.0
 
       - name: Check advisories, licenses, bans and sources
         run: cargo deny --locked check
