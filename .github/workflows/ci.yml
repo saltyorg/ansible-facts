@@ -105,7 +105,10 @@ jobs:
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           # renovate: datasource=crate depName=cargo-deny
-          tool: cargo-deny@0.21.0
+          tool: cargo-deny@0.20.2
+          # Install only versions the pinned install-action release has
+          # checksums for, instead of silently falling back to cargo-binstall.
+          fallback: none
 
       - name: Check advisories, licenses, bans and sources
         run: cargo deny --locked check

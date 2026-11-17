@@ -110,6 +110,7 @@ jobs:
         with:
           # Keep in step with the ghcr.io/cross-rs images used below.
           tool: cross@0.2.5
+          fallback: none
 
       - name: Build Release Binary
         # Keep this cross-build workaround scoped to release artifacts instead
