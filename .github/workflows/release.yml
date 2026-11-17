@@ -118,7 +118,8 @@ jobs:
         env:
           AWS_LC_SYS_NO_JITTER_ENTROPY: "1"
           CROSS_BUILD_ENV_PASSTHROUGH: AWS_LC_SYS_NO_JITTER_ENTROPY
-        run: cross build --release --locked --target ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+        run: cross build --release --locked --target "${TARGET}"
 
       - name: Validate ARMv5 runtime compatibility
         if: matrix.arch == 'armv5'
@@ -153,11 +154,10 @@ jobs:
           esac
 
       - name: Prepare binary
-        run: |
-          cd target/${{ matrix.target }}/release
-          BINARY_NAME="saltbox-facts"
-          OUTPUT_NAME="saltbox-facts-${{ matrix.arch }}"
-          mv ${BINARY_NAME} ${OUTPUT_NAME}
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: mv "target/${TARGET}/release/saltbox-facts" "target/${TARGET}/release/saltbox-facts-${ARCH}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -172,7 +172,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
-      contents: write
+      contents: write # create the GitHub release and upload its binaries
 
     steps:
       - name: Download all artifacts
@@ -191,13 +191,13 @@ jobs:
               mv "$dir"/* release/
             fi
           done
-          
+
           # Create legacy name for amd64 if it exists
           if [ -f "release/saltbox-facts-amd64" ]; then
             cp release/saltbox-facts-amd64 release/saltbox-facts
             echo "Created legacy binary: saltbox-facts"
           fi
-          
+
           # List files for verification
           echo "Release files:"
           ls -lh release/
@@ -214,5 +214,5 @@ jobs:
     needs: release
     permissions:
       contents: read
-      issues: write
+      issues: write # open, annotate and close advisory issues
     uses: ./.github/workflows/security.yml
